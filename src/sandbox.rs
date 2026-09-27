@@ -103,8 +103,9 @@ impl Sandbox for DockerSandbox {
 
         // Create ephemeral host directory for mounting
         let container_name = format!("distjob-{}", job.id);
-        let host_temp_dir: PathBuf = std::env::temp_dir().join(&container_name);
+        let host_temp_dir: PathBuf = std::env::temp_dir().join(&container_name); // making a temp dir with the job id (not a global dir cuz then again tasks of other client can be leaked)
 
+        // handling errors while creating and writing to the dir 
         if let Err(e) = fs::create_dir_all(&host_temp_dir) {
             return SandboxExecutionResult {
                 status: JobState::Failed,
@@ -137,7 +138,7 @@ impl Sandbox for DockerSandbox {
         // - CPU limit: --cpus <cpu>
         // - Process limit: --pids-limit <pids>
         // - Read-only root filesystem: --read-only
-        // - Small writable tmpfs: --tmpfs /tmp:rw,noexec,nosuid,size=<size>
+        // - Small writable tmpfs: --tmpfs /tmp:rw,noexec,nosuid,size=<size> // LEARN ABOUT NOSUID (idk about this)....
         // - Read-only host mount for script: -v <host_temp>:/code:ro
         // - No docker socket mounted
         // - gVisor runtime if enabled: --runtime runsc
@@ -209,6 +210,17 @@ impl Sandbox for DockerSandbox {
             let _ = (&mut stderr_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
             String::from_utf8_lossy(&buf).to_string()
         });
+
+        // NOT THAT WELL UNDERSTOOD BUT HERE IT IS : rust spawns a child process docker run cli . the code inside the containers produces output and erorr streams 
+        // this stdout/stderr is given to the docker cli (the child proecess of rust) . the docker cli pumps this output ot the OS's stderrr/ stdout pipe . 
+        // this buffer has a limited size 64kb typically , supposed it dumps 100kb data , now the buffer is full , the child process cant put more data in the buffer. 
+        // As a result it freezes and waits for its parent process to read the data (but here the thread that spwaned the container is waiting for the container's output , so IT CANT READ ANYTHING,) 
+        // causing a deadlock . to fix this we asynchronously (via threads) read the stderr / stdout in the buf vector.
+
+        // formal defn of the deadlock : An OS-level deadlock with stdout and stderr happens when a child process fills the operating system's internal pipe buffer (usually 64KB) by writing too much data to one stream (like stderr) while the parent process is busy reading or waiting on a different stream (like stdout), causing both processes to freeze indefinitely.
+
+
+
 
         // Enforce hard wall-clock timeout
         let mut timed_out = false;

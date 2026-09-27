@@ -30,7 +30,7 @@ impl std::fmt::Display for JobState {
 /// A request to execute code in a sandbox.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRequest {
-    pub client_id: String,
+    pub client_id: String, // we wanna make sure we keep a track of whom this request belongs too . 
     pub language: String,
     pub code: String,
     #[serde(default)]
@@ -43,7 +43,7 @@ pub struct JobRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     pub id: String,
-    pub client_id: String,
+    pub client_id: String, // storing the client id inside the job along with the job id , had we not done this any client who is aware of the job id of a job submitted by another clinet would be able to poll the job !!! (security risk)
     pub language: String,
     pub code: String,
     pub stdin: Option<String>,
@@ -91,7 +91,7 @@ impl Job {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobResult {
     pub job_id: String,
-    pub client_id: String,
+    pub client_id: String, // this !!! prevents people from veiwing the results of otheer peoples code . 
     pub status: JobState,
     pub stdout: String,
     pub stderr: String,

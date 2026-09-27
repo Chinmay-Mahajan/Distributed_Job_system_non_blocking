@@ -5,8 +5,8 @@ pub enum SandboxType {
     /// Full Docker sandbox with gVisor / limits as specified in plan.md
     Docker,
     /// Local process sandbox (useful for local development or when Docker is inactive)
-    Local,
-    /// Mock sandbox for deterministic testing
+    Local, // runs code directly on my machine (with timeouts but no virtualisation.. )
+    /// Mock sandbox for deterministic testing , returns fake results for the sake of testing 
     Mock,
 }
 
@@ -30,13 +30,13 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_address: "127.0.0.1:7000".to_string(),
+            bind_address: "127.0.0.1:7000".to_string(), // the port that we are serving our server on. (locally) 
             worker_count: 4,
-            max_in_flight_per_client: 2,
-            default_timeout_secs: 10,
+            max_in_flight_per_client: 2, // max num of current running jobs for each client 
+            default_timeout_secs: 10, //  wall clock time for a single job (running) 
             max_timeout_secs: 60,
-            result_ttl: Duration::from_secs(600), // 10 minutes (per plan.md §2.6)
-            cleanup_interval: Duration::from_secs(30),
+            result_ttl: Duration::from_secs(600), // 10 minutes (per plan.md §2.6) WE DONT WANT RESULTS TO STAY IN THE MEMORY FOREVER !! 
+            cleanup_interval: Duration::from_secs(30), // A background thread clears the entries in the store with time elapsed > result_ttl
             sandbox_type: SandboxType::Docker,
             docker_runtime: std::env::var("DISTJOB_DOCKER_RUNTIME").ok(), // e.g. "runsc"
             docker_memory: "128m".to_string(),

@@ -14,6 +14,9 @@ struct StoredEntry {
 
 pub struct ResultStore {
     entries: RwLock<HashMap<String, StoredEntry>>,
+    // A rwlock is used here and not a mutex as a mutex is blocks all the other threads from even reading when one is reading the shared data . 
+    // a rwlock allows multiple thread to read at once as long as they dont mutate the shared data . maintains a reader and also a writer lock so more overhead .
+    // but but but in this case the read ops on the shared hashmap dominate the write ops .
     ttl: Duration,
 }
 
@@ -44,7 +47,7 @@ impl ResultStore {
             expires_at: now + self.ttl,
         };
 
-        let mut lock = self.entries.write().unwrap();
+        let mut lock = self.entries.write().unwrap(); // aquire the lock and write (write lock , using .write())
         lock.insert(job.id.clone(), entry);
     }
 

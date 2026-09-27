@@ -4,16 +4,19 @@ use std::sync::{Condvar, Mutex};
 use crate::model::Job;
 
 struct InnerScheduler {
-    client_queues: HashMap<String, VecDeque<Job>>,
-    client_in_flight: HashMap<String, usize>,
+    client_queues: HashMap<String, VecDeque<Job>>, // the client id and per cliinet queue 
+    client_in_flight: HashMap<String, usize>, // clinet id | num of jobs in flight for each client 
     client_order: VecDeque<String>,
     max_in_flight_per_client: usize,
     shutdown: bool,
 }
 
 pub struct TwoLevelScheduler {
-    inner: Mutex<InnerScheduler>,
-    condvar: Condvar,
+    inner: Mutex<InnerScheduler>, // to make this safe for sharing amongst threads 
+    condvar: Condvar, // basically -> avoids the situation when we have threads just sitting idly waiting for data from another thread 
+    // prevents the while(!flag){..} which uses 100% of the cpu core the thread is running on. BURNS CPU , instead condvar (condtional var) asks OS 
+    // to drop this thread form its schedulling loop (so this thread never runs and sleeps  0% cpu) and when the producer thread does produce the 
+    // required data the condvar notifies the consumer thread to wake up with the mutex lock. 
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
