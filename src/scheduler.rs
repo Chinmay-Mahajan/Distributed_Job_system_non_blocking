@@ -6,7 +6,7 @@ use crate::model::Job;
 struct InnerScheduler {
     client_queues: HashMap<String, VecDeque<Job>>, // the client id and per cliinet queue 
     client_in_flight: HashMap<String, usize>, // clinet id | num of jobs in flight for each client 
-    client_order: VecDeque<String>,
+    client_order: VecDeque<String>, // the order in which the clients jobs are gonna be scheduled.. 
     max_in_flight_per_client: usize,
     shutdown: bool,
 }
@@ -62,7 +62,11 @@ impl TwoLevelScheduler {
         }
 
         // Wake up a waiting worker
-        self.condvar.notify_one();
+        drop(inner); // A new thing i learnt , we should ideally drop the mutex guard before calling the condvar.notify_one() , as when the sleeping thread wakes up the first thing it does it try to aquire the mutex (the condvar ensures this)
+        // now if the thread is not able to aquire the lock the thread now moves to the mutex wait queue (what is it called exactly??). Until the main thread gives up the ownership of the lock this worker thread can not start . 
+        // also to prevent race condition (between the worker thread and the main thread to aquire and to give up the lock) we must drop the inner guard
+        self.condvar.notify_one(); 
+
     }
 
     /// Worker dispatch loop:
@@ -84,12 +88,14 @@ impl TwoLevelScheduler {
                     Some(id) => id,
                     None => break,
                 };
+                // this just fetches the id of the client who is currently the one to go (according to round robin manner)
 
-                let in_flight = inner.client_in_flight.get(&client_id).copied().unwrap_or(0);
+                let in_flight = inner.client_in_flight.get(&client_id).copied().unwrap_or(0); // how many jobs in flight are there for this client 
                 let can_dispatch = in_flight < inner.max_in_flight_per_client;
 
                 if can_dispatch
                     && let Some(job) = inner.client_queues.get_mut(&client_id).and_then(|q| q.pop_front())
+                // has that client submitted a job that is pending ??? (it will be in the client's queue)
                 {
                     // Increment in-flight counter
                     *inner.client_in_flight.entry(client_id.clone()).or_insert(0) += 1;
@@ -101,6 +107,7 @@ impl TwoLevelScheduler {
                 }
 
                 // If not dispatched, still maintain client in rotation
+                // WHAT IF A CLIENT JUST SITS IDLE AND DOESNT SUBMIT ANY REQUESTS ???? , THEN THAT CLIENT IS TAKING UP RAM ON THE SERVER MACHINE WASTING IT !!!!. (I WILL TRY TO TEST THISS.)
                 inner.client_order.push_back(client_id);
             }
 
@@ -110,6 +117,10 @@ impl TwoLevelScheduler {
 
             // No eligible jobs right now; wait for submission or completion
             inner = self.condvar.wait(inner).unwrap();
+            // look at submit function of the twolevelscheduler , there we use CondVar to notify the sleeping workers once a client has submitted a job . 
+            // had we not used it , using a traditional boolean flag which would be read by all worker threads continously then that would create severe wastage of cpu cycles . 
+            
+
         }
     }
 
