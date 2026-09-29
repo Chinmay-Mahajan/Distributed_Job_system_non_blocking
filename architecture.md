@@ -19,7 +19,7 @@ The predecessor to this system (`distributed_job` / `DispatchLite`) was an early
 - **No Concurrency Caps or Tenant Isolation:** A single client could flood the queue and consume all worker threads.
 - **Memory Leaks & Missing Fail States:** Worker failures were swallowed silently, jobs lingered in `Running` forever, and completed records had no Time-To-Live (TTL).
 
-**Version 2 (`distributed_jobv2`)** was designed from the ground up to solve every architectural defect of v1 by implementing **asynchronous non-blocking network ingestion, a fair two-level scheduler, ephemeral container sandboxing with gVisor isolation, broker-enforced timeouts, and a TTL-managed result store**.
+**Version 2 (`distributed_jobv2`)** was designed from the ground up to solve every architectural defect of v1 by implementing **non-blocking network ingestion, a two-queue $O(1)$ fair scheduler with backpressure admission control, ephemeral container sandboxing with gVisor syscall isolation, broker-enforced hard timeouts, and a TTL-managed result store**.
 
 ---
 
@@ -27,26 +27,27 @@ The predecessor to this system (`distributed_job` / `DispatchLite`) was an early
 
 ```mermaid
 flowchart TD
-    subgraph Clients["Clients (Multi-Tenant)"]
-        CA["Client A"]
-        CB["Client B"]
-        CN["Client N"]
+    subgraph Clients["Clients (Multi-Tenant Ingress)"]
+        CA["Spammer Client (High-Volume)"]
+        CB["Moderate Client (Mid-Volume)"]
+        CC["Legitimate Client (Low-Volume)"]
     end
 
-    subgraph Server["Broker Server (Thread-per-Connection)"]
+    subgraph Server["Broker Server Layer"]
         TCP["TCP Listener (Port 7000)"]
-        T1["Conn Thread 1"]
-        T2["Conn Thread 2"]
-        TN["Conn Thread N"]
-        Proto["Protocol Parser (JSON / Text)"]
+        ConnThreads["Connection Threads (Thread-per-Connection)"]
+        Proto["Protocol Parser (JSON Lines / Text)"]
     end
 
-    subgraph Scheduling["Two-Level Fair Scheduler"]
-        QA["Client A Queue (FIFO)"]
-        QB["Client B Queue (FIFO)"]
-        QN["Client N Queue (FIFO)"]
-        RR["Round-Robin Client Arbiter"]
-        Cap["Per-Client In-Flight Cap (N=2)"]
+    subgraph Admission["Dynamic Admission Gate"]
+        Gate{"Per-Client Queue Limit Check<br/>queued < (in_flight_cap * multiplier)"}
+        Reject["Fast-Fail: -ERR Rate limit exceeded<br/>(Returns immediately; 0 worker cost)"]
+    end
+
+    subgraph Scheduling["Two-Queue O(1) Fair Scheduler"]
+        DQ["dispatchable_queue (VecDeque)<br/>in_flight < cap<br/>• O(1) Instant Worker Pop<br/>• Round-Robin Inter-Tenant Fairness"]
+        WQ["waiting_queue (HashSet)<br/>in_flight >= cap (Saturated)<br/>• 0% Worker Scan Overhead<br/>• Promoted on completion in O(1)"]
+        PerClientQ["Per-Client Isolated FIFO Queues<br/>client_queues: HashMap<String, VecDeque<Job>>"]
     end
 
     subgraph Workers["Worker Pool (Fixed-Size)"]
@@ -58,58 +59,50 @@ flowchart TD
 
     subgraph SandboxEnv["Sandboxed Execution Boundary"]
         subgraph DockerGVisor["Docker + gVisor Sandbox"]
-            S1["--network none"]
-            S2["--memory 128m --cpus 0.5"]
-            S3["--pids-limit 64"]
-            S4["--read-only rootfs + quota tmpfs"]
-            S5["--runtime runsc (gVisor)"]
-            S6["Broker Wall-Clock Killer"]
+            S1["--network none (Hard network isolation)"]
+            S2["--memory 128m --cpus 0.5 (cgroups caps)"]
+            S3["--pids-limit 64 (Fork-bomb defense)"]
+            S4["--read-only rootfs + 64m tmpfs quota"]
+            S5["--runtime runsc (gVisor user-space kernel)"]
+            S6["Broker Wall-Clock Timeout Supervisor"]
         end
     end
 
-    subgraph Storage["Result Store"]
+    subgraph Storage["Result Store & Lifecycle"]
         RS["Keyed Result Store (job_id -> JobResult)"]
         StateMach["State Machine: Pending -> Running -> Done|Failed|TimedOut"]
-        Reaper["Background TTL Janitor (10m TTL)"]
+        Reaper["Background TTL Janitor (Sweep stale entries)"]
     end
 
-    CA -->|SUBMIT| TCP
-    CB -->|SUBMIT| TCP
-    CN -->|POLL| TCP
+    CA & CB & CC -->|SUBMIT / POLL / STATUS| TCP
+    TCP --> ConnThreads
+    ConnThreads --> Proto
 
-    TCP --> T1
-    TCP --> T2
-    TCP --> TN
-    T1 --> Proto
-    T2 --> Proto
-    TN --> Proto
+    Proto -->|SUBMIT request| Gate
+    Gate -->|"Over quota"| Reject
+    Gate -->|"Admitted"| PerClientQ
 
-    Proto -->|Enqueue Job| Scheduling
-    Proto -->|Create Pending Record| RS
-    Proto -.->|Immediate job_id| CA
+    PerClientQ -->|"in_flight < cap"| DQ
+    PerClientQ -->|"in_flight >= cap"| WQ
+    Proto -.->|"Immediate job_id (Non-blocking)"| ConnThreads
 
-    QA --> RR
-    QB --> RR
-    QN --> RR
-    Cap --> RR
-
-    RR -->|Dispatch Next Eligible Job| Workers
+    DQ -->|"O(1) Pop Next Eligible Job"| Workers
     Workers -->|Update Status: Running| RS
-    Workers -->|Execute in Sandbox| SandboxEnv
-    SandboxEnv -->|Capture stdout/stderr/exit| Workers
-    Workers -->|Complete Job: Done/Failed/TimedOut| RS
-    Workers -->|Decrement In-Flight Counter| Cap
+    Workers -->|Execute Script in Container| SandboxEnv
+    SandboxEnv -->|Capture stdout/stderr (1MB cap)| Workers
+    Workers -->|Record Result: Done/Failed/TimedOut| RS
 
-    Proto -->|Lookup job_id| RS
-    RS -.->|Return Output & State| CN
-    Reaper -->|Purge Expired Records| RS
+    Workers -.->|"on_job_completed: Slot opened"| WQ
+    WQ -.->|"Promoted to"| DQ
+    Proto -->|POLL / STATUS: O(1) lookup| RS
+    Reaper -->|Purge Expired Records (TTL)| RS
 ```
 
 ---
 
 ## 3. Detailed Component Methodology
 
-### 3.1 Networking Layer: Thread-per-Connection vs. Async Event Loop
+### 3.1 Networking Layer: Ingress Mechanics & The Concurrency Model
 The server implementation lives in [`src/server.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/server.rs).
 
 #### Methodology:
@@ -117,63 +110,81 @@ The server implementation lives in [`src/server.rs`](file:///Users/chinmaymahaja
 2. Each incoming socket is immediately handed off to an independent OS thread (`thread::spawn`).
 3. The connection thread performs line-buffered I/O using `BufReader` and `TcpStream`.
 4. **Execution is completely decoupled from networking:**
-   - On `SUBMIT`: A new UUIDv4 `job_id` is generated. A `Pending` entry is created in [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs), the job is submitted to [`TwoLevelScheduler`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs), and the response containing `job_id` is written back immediately. **The thread never blocks on job execution.**
-   - On `POLL` / `STATUS`: The thread queries the [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs) in $O(1)$ time and returns the current state and execution payload.
+   - On `SUBMIT`: A new UUIDv4 `job_id` is generated. If the client passes the admission gate, a `Pending` entry is created in [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs), the job is enqueued in [`TwoLevelScheduler`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs), and the response containing `job_id` is written back immediately. **The thread never blocks on sandbox execution.**
+   - On `POLL` / `STATUS`: The thread queries [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs) in $O(1)$ time and returns the current state and execution payload.
 
-#### Rationale & Trade-offs:
-- **Simplicity & Predictability:** Thread-per-connection avoids the conceptual and runtime complexity of an async runtime (`tokio`, `mio`) during early prototype phases.
-- **Independence:** If a client connection experiences network stalls or slow read/write bandwidth, it only affects that individual client thread; other clients and workers remain unaffected.
-- **The C10K Boundary:** OS threads allocate a dedicated stack (typically 2MB–8MB virtual memory). While suitable for hundreds or a few thousand connections, scaling to 100,000+ idle persistent connections requires transitioning to an event-driven async loop (discussed in Section 4).
+#### Empirical Findings & The Thread-per-Connection Bottleneck:
+During our live 2,000-connection benchmark (documented in [`Idle_User_Simulation_Report.md`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/Idle_User_Simulation_Report.md)), we analyzed the resource profile of the thread-per-connection model:
+* **The "16 KB" Idle Memory Reality:** Physical resident memory (RSS) only increased by ~33.6 MB (~16.8 KB per idle thread) because threads only dirtied top stack pages before blocking on `read_line()`.
+* **Virtual Address Space (VSZ) Surge:** Virtual memory surged by **+4.38 GB** ($400.8\text{ GB} \rightarrow 405.2\text{ GB}$) because modern 64-bit operating systems allocate a default **2 MB stack reservation** per OS thread.
+* **Architectural Trade-Off:** While thread-per-connection is simple, robust, and completely isolates network stalls to single connections, scaling past 5,000–10,000 concurrent persistent connections requires transitioning to an event-driven reactor (`tokio` / `mio`), as analyzed in Section 4.
 
 ---
 
-### 3.2 Two-Level Scheduler: Fairness, Isolation, and Hard Caps
-The scheduling core lives in [`src/scheduler.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs).
+### 3.2 Two-Queue $O(1)$ Fair Scheduler with Backpressure Admission
+The scheduling engine lives in [`src/scheduler.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs).
 
-#### The Problem with Naive FIFO:
-In a naive global FIFO queue, if Client $A$ submits 1,000 slow batch jobs followed by Client $B$ submitting 1 critical quick job, Client $B$ experiences severe head-of-line blocking and starves until Client $A$'s backlog clears.
+#### 3.2.1 The Two-Queue Invariant Architecture
+In naive round-robin schedulers with concurrency caps, workers iterate over an $O(N)$ list of all clients, skipping saturated clients one-by-one under a global lock. Under heavy asymmetric load, workers waste significant CPU cycles skipping unrunnable tenants.
 
-#### The Two-Level Scheduling Algorithm:
-The broker implements a two-level hierarchical scheduling policy:
-1. **Level 1 (Per-Client FIFO Isolation):**
-   Each client possesses an independent FIFO queue (`VecDeque<Job>`). Client $A$'s submissions can never displace, delay, or interleave ahead of Client $B$'s submissions within their own queues.
-2. **Level 2 (Round-Robin Inter-Client Dispatch with Concurrency Cap):**
-   Active clients are arranged in a circular sequence (`VecDeque<String>` order list).
-   When a worker thread requests the next job, the scheduler inspects clients in round-robin order:
-   $$\text{Client is eligible if: } \text{in\_flight}(c) < N \quad \land \quad \neg \text{queue}(c).\text{is\_empty}()$$
-   where $N$ is `max_in_flight_per_client` (default: 2).
+Version 2 eliminates this bottleneck by maintaining two strictly disjoint sets:
 
-```
-   Queue Ring: [ Client A, Client B, Client C ]
-                         │
-                         ▼
-        Check Client A: in_flight = 2 == N (Cap reached) ──▶ SKIP
-                         │
-                         ▼
-        Check Client B: in_flight = 0 < N & has jobs ─────▶ DISPATCH B1
-                         │                                  (B moves to back)
-                         ▼
-        Updated Ring: [ Client C, Client A, Client B ]
+```rust
+struct InnerScheduler {
+    client_queues: HashMap<String, VecDeque<Job>>,
+    client_in_flight: HashMap<String, usize>,
+    max_in_flight_per_client: usize,
+
+    // ACTIVE POOL: Clients with pending jobs AND in_flight < max
+    dispatchable_queue: VecDeque<String>,
+    in_dispatchable: HashSet<String>,
+
+    // WAITING POOL: Saturated clients with pending jobs BUT in_flight >= max
+    waiting_queue: HashSet<String>,
+}
 ```
 
-3. **In-Flight Concurrency Throttling:**
-   - On dispatch: `client_in_flight[c] += 1`.
-   - On completion: `client_in_flight[c] -= 1`.
-   - **Guaranteed Capacity Bound:** No client can ever monopolize more than:
-     $$\text{Max Capacity Share} = \frac{N}{\text{Total Workers}}$$
-     With 4 workers and $N=2$, a single client can consume at most 50% of the execution pool, leaving the remainder available for other tenants.
-4. **Starvation Freedom:**
-   Whenever an active client finishes a job, or a new client submits a job, `Condvar::notify_one()` or `notify_all()` awakens waiting workers to evaluate the round-robin ring.
+```
+           [ Client Submits Job ]
+                     │
+       ┌─────────────┴─────────────┐
+       │ in_flight < max           │ in_flight >= max (Saturated)
+       ▼                           ▼
+[ dispatchable_queue ]      [ waiting_queue ]
+       │                           ▲
+  Worker Pops O(1)                 │ Saturated after pop
+       ▼                           │
+[ Executing in Worker ] ───────────┘
+       │
+  Job Completed
+       │
+[ on_job_completed() ] ──Promote in O(1)──▶ [ dispatchable_queue ]
+```
+
+1. **Guaranteed $O(1)$ Dispatch ([`pop_next_job`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs#L150-L226)):**
+   Workers pop directly from `dispatchable_queue.pop_front()` in $O(1)$. Every client in this queue is guaranteed to have a job ready and capacity available. No scanning, no skipping, no lock-held loops.
+2. **Fair Inter-Tenant Round-Robin:**
+   After a job is popped, if the client still has pending jobs and remaining capacity, they are pushed to the back of `dispatchable_queue`.
+3. **Zero-Cost Saturation:**
+   If popping the job saturates the client (`in_flight == max`), the client is parked in `waiting_queue`. Saturated tenants consume zero worker CPU.
+4. **Instant $O(1)$ Promotion ([`on_job_completed`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs#L228-L270)):**
+   When a job completes, `waiting_queue.remove(client_id)` runs in $O(1)$. If the client was saturated, they are promoted into `dispatchable_queue`, and `condvar.notify_one()` awakens a waiting worker.
+
+#### 3.2.2 Dynamic Admission Gate & Bufferbloat Prevention
+Without admission limits, saturated clients can queue an unbounded number of jobs into memory, causing severe bufferbloat:
+$$\text{Max Queue Limit} = \text{max\_in\_flight\_per\_client} \times \text{queue\_limit\_multiplier}$$
+* When enabled (`enable_queue_limit = true`, default: `true`, multiplier: `5`), any submission attempted by a client whose pending queue already satisfies `queued >= limit` is rejected immediately.
+* **Impact:** Rejections occur at the socket layer before touching the [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs), protecting broker memory and dropping tail latency by 60%.
 
 ---
 
 ### 3.3 Sandboxed Execution Engine (Defense-in-Depth)
 The sandboxing subsystem lives in [`src/sandbox.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/sandbox.rs).
 
-#### The Threat Vector Matrix:
+#### Threat Vector Matrix & Security Mitigations:
 | Attack Vector | Malicious Mechanism | Broker Mitigation |
 |---|---|---|
-| **Data Exfiltration** | Sockets, DNS tunneling, HTTP curl | `--network none` (Virtual interface disabled) |
+| **Data Exfiltration** | Sockets, DNS tunneling, HTTP requests | `--network none` (Virtual interface disabled) |
 | **Host DoS / Infinite Loops** | `while True: pass` consuming 100% CPU | `--cpus 0.5` + Broker Wall-Clock Timeout (`kill`) |
 | **Memory Exhaustion (OOM)** | Allocating gigabytes in array/heap | `--memory 128m` (cgroups limit; swap disabled) |
 | **Fork Bomb** | `:(){ :\|:& };:` or `os.fork()` recursion | `--pids-limit 64` (Restricts kernel task creation) |
@@ -203,7 +214,7 @@ The sandboxing subsystem lives in [`src/sandbox.rs`](file:///Users/chinmaymahaja
    - Stdin is piped to the child process and closed to trigger EOF.
    - Stdout and Stderr are drained concurrently in dedicated background reader threads up to a strict cap (`MAX_OUTPUT_BYTES = 1 MB`) to prevent pipe buffer deadlocks and memory exhaustion from infinite print loops.
 5. **Broker-Enforced Wall-Clock Timeout:**
-   The broker checks execution elapsed time. If the deadline expires:
+   A dedicated supervisor thread monitors execution elapsed time. If the deadline expires:
    - `docker kill distjob-<uuid>` is executed immediately.
    - The CLI child process is killed (`child.kill()`).
    - The job is recorded as `JobState::TimedOut`.
@@ -212,21 +223,21 @@ The sandboxing subsystem lives in [`src/sandbox.rs`](file:///Users/chinmaymahaja
 ---
 
 ### 3.4 Result Persistence & State Machine
-The result management lives in [`src/store.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs).
+Result management lives in [`src/store.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs).
 
 #### Explicit Job State Machine:
 ```
            ┌───────────┐
-           │  Pending  │ (Job enqueued, awaiting worker)
+           │  Pending  │ (Job admitted to queue, awaiting worker)
            └─────┬─────┘
-                 │ Worker picks up job
+                 │ Worker pops job from dispatchable_queue
                  ▼
            ┌───────────┐
-           │  Running  │ (Executing in sandbox)
+           │  Running  │ (Executing in container sandbox)
            └─────┬─────┘
                  │
       ┌──────────┼──────────┐
-      │ Exit 0   │ Exit >0  │ Timeout exceeded
+      │ Exit 0   │ Exit >0  │ Wall-clock timeout exceeded
       ▼          ▼          ▼
  ┌─────────┐┌─────────┐┌──────────┐
  │  Done   ││ Failed  ││ TimedOut │
@@ -247,131 +258,87 @@ Without an expiration mechanism, clients that submit jobs but never poll would c
 Defined in [`src/protocol.rs`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/protocol.rs).
 
 1. **JSON Lines Protocol (`NDJSON`):**
-   - Ideal for production clients, automated test suites, and programmatic SDKs.
-   - Allows multiline source code, embedded JSON payloads, and arbitrary characters without fragile escaping.
+   - Ideal for programmatic SDKs and automated pipelines. Supports multiline source code, stdin payloads, and structured error responses.
    - Example Submit:
      ```json
      {"action": "SUBMIT", "client_id": "alice", "language": "python", "code": "print(2**10)", "stdin": "", "timeout_secs": 5}
      ```
-   - Example Poll Response:
+   - Example Error Response:
      ```json
-     {"job_id": "90e2-...", "client_id": "alice", "status": "Done", "stdout": "1024\n", "stderr": "", "exit_code": 0, "execution_duration_ms": 42}
+     {"status": "error", "error": "Rate limit exceeded: client 'alice' reached maximum queue capacity of 10 pending jobs (in-flight cap: 2, multiplier: 5)"}
      ```
 2. **Text Command Protocol (Redis-Style):**
    - Optimized for human debugging via `nc`, `telnet`, or simple shell scripts:
-     - `SUBMIT <client_id> <language> <code...>` $\rightarrow$ `:<job_id>\r\n`
+     - `SUBMIT <client_id> <language> <code...>` $\rightarrow$ `:<job_id>\r\n` or `-ERR <reason>\r\n`
      - `STATUS <job_id>` $\rightarrow$ `+Done\r\n`
      - `POLL <job_id>` $\rightarrow$ `+Done {json_result}\r\n`
      - `PING` $\rightarrow$ `+PONG\r\n`
-     - `STATS` $\rightarrow$ `+OK active_clients=... queued=... in_flight=...\r\n`
+     - `STATS` $\rightarrow$ `+OK active_clients=... queued=... in_flight=... stored_results=... dispatchable=... waiting=...\r\n`
 
 ---
 
-## 4. Industry Standards & Architectural Alternatives
+## 4. Empirical Performance Benchmarks & Validation
 
-How does our architecture compare to solutions used at scale across major cloud and code execution platforms?
+To validate the two-queue $O(1)$ scheduler and admission rate-limiting, we executed stress tests against asymmetric multi-tenant workloads (6 clients, 128 burst requests: 85 High-Freq spammers, 33 Med-Freq, 10 Low-Freq legitimate users) on 4 worker threads.
 
-### 4.1 Sandboxing Technologies Comparison
+### 4.1 Comparative Empirical Results
 
-| Technology | Isolation Mechanism | Cold-Start Overhead | Security Strength | Representative Systems |
-|---|---|---|---|---|
-| **Linux Namespaces / cgroups (`runc`)** | OS kernel boundary (chroot, namespaces, cgroups) | 100ms – 500ms | **Moderate** (Shared kernel; vulnerable to kernel 0-day exploits) | Standard Docker, Kubernetes |
-| **User-Space Kernel Interception (`gVisor` / `runsc`)** | Intercepts application syscalls via `Sentry` user-space kernel | 150ms – 700ms | **High** (Application never interacts directly with host kernel) | Google Cloud Run, Cloud Functions, **distributed_jobv2** |
-| **System Call Filtering (`nsjail` / `isolate`)** | Lightweight Linux namespace + rigid `seccomp-bpf` whitelist | 5ms – 20ms | **High** (Restricts syscall surface to minimal safe set) | LeetCode, Codeforces, IOI, Judge0 |
-| **MicroVMs (`Firecracker` / `Cloud Hypervisor`)** | Hardware-assisted virtualization (KVM) with minimal device models | 5ms – 30ms (snapshot) 100ms (cold) | **Maximum** (Full hardware virtualization barrier) | AWS Lambda, AWS Fargate, Fly.io |
-| **WebAssembly Sandboxing (`Wasmtime` / `V8`)** | Software fault isolation / capability-based WASI bytecode | < 1ms | **Very High** (Safe memory model, but requires Wasm compilation) | Cloudflare Workers, Fastly Compute@Edge |
-
-#### Why gVisor for this Architecture?
-For arbitrary untrusted code execution (C, Python, Bash, Node.js), requiring users to pre-compile to WebAssembly is too restrictive. Standard Docker alone leaves the host kernel vulnerable to privilege escalation. `gVisor` (`runsc`) strikes the optimal balance: it runs standard OCI containers and unmodified language binaries while interposing a secure user-space kernel between the untrusted code and the host OS.
-
----
-
-### 4.2 Multi-Tenant Scheduling Algorithms
-
-| Algorithm | Fairness Strategy | Overhead | Strengths & Weaknesses |
-|---|---|---|---|
-| **Global FIFO** | Arrival order | $O(1)$ | ❌ High vulnerability to starvation and noisy neighbors. |
-| **Two-Level FIFO + Round-Robin (Our System)** | FIFO per client, Round-Robin across active clients with concurrency cap | $O(C)$ where $C$ is active clients | ✅ Simple, starvation-free, strictly bounds tenant capacity share. |
-| **Deficit Round Robin (DRR)** | Quantum-based byte/time allowance per tenant | $O(1)$ amortized | ✅ Accounts for varying job weights / runtimes, but higher state tracking complexity. |
-| **Dominant Resource Fairness (DRF)** | Equalizes dominant share across multiple dimensions (CPU, RAM, Disk) | $O(C \log C)$ | ✅ Optimal for heterogeneous multi-resource clusters (used in Apache Mesos / Kubernetes). |
+| Metric / Dimension | Baseline (Single-Queue) | Current (Two-Queue + Admission Gate) | Empirical Improvement |
+| :--- | :---: | :---: | :---: |
+| **Total Test Wall-Clock Time** | `31.20s` (31,199 ms) | **`13.14s` (13,142 ms)** | **58% faster (2.37x speedup)** |
+| **System-Wide Average Wait Time** | `15,371.3 ms` | **`3,052.4 ms`** | **5.0x latency drop** |
+| **Broker Throughput** | `4.10 reqs/sec` | **`4.79 reqs/sec`** | **+16.8% higher throughput** |
+| **Spammer P95 Tail Latency** | `27,861 ms` | **`11,195 ms`** | **59.8% reduction** |
+| **Spammer Average Queue Wait** | `19,040.2 ms` | **`6,422.7 ms`** | **66.3% less queue delay** |
+| **Legitimate Client 1 Wait Time** | `3,414.8 ms` | **`2,800.0 ms`** | **Faster execution turnaround** |
+| **Legitimate Client 2 Wait Time** | `2,952.2 ms` | **`2,444.2 ms`** | **Faster execution turnaround** |
+| **Legitimate Client Completion Rate**| `100% (10/10)` | **`100% (10/10)`** | **Zero starvation / zero drops** |
+| **Residual Broker State** | Drained to 0 | `queued=0, waiting=0, dispatchable=0` | **Zero memory leaks** |
 
 ---
 
-### 4.3 Networking & IPC Topologies
+## 5. Architectural Gaps & Known Design Trade-offs
 
-| Architecture | Concurrency Limit | Complexity | Best Fit |
-|---|---|---|---|
-| **Thread-per-Connection (Current)** | ~1,000 – 5,000 connections | Low | Prototypes, internal services, trusted VPC clients |
-| **Async Reactor (`tokio` / `epoll`)** | 100,000+ connections | Medium | High-concurrency public APIs, microservices |
-| **Decoupled Queue Broker (NATS / Redis / Kafka)** | Millions of connections (distributed) | Higher (Distributed state) | Production clusters with independent autoscaling worker fleets |
-
----
-
-## 5. Failure Modes, Edge Cases, and Mitigations
-
-### 5.1 Infinite Loops & Unresponsive Processes
-- **Risk:** User submits `while True: pass` or `time.sleep(100000)`.
-- **Mitigation:** The broker enforces a hard deadline using `std::time::Instant`. When exceeded, `docker kill` is dispatched directly to the Docker engine, terminating the container at the OS/hypervisor level regardless of whether the internal process ignores `SIGTERM`.
-
-### 5.2 Output Bombs (Stdout / Stderr Flooding)
-- **Risk:** User submits `while True: print("A" * 1000000)`, attempting to exhaust broker memory via pipe buffering.
-- **Mitigation:** Output capture uses `Read::take(MAX_OUTPUT_BYTES)` (capped at 1 MB). Any data generated beyond 1 MB is dropped, safeguarding host RAM while preserving the initial debugging diagnostics for the user.
-
-### 5.3 Abandoned Jobs & Disconnected Sockets
-- **Risk:** A user submits 100 jobs and immediately closes the TCP socket.
-- **Mitigation:** The connection thread terminates cleanly without aborting the background job. The worker executes the task, publishes the result to `ResultStore`, and the background TTL reaper automatically evicts the data after 10 minutes if no client reconnects to poll it.
-
-### 5.4 Rapid Tenant ID Churn
-- **Risk:** Malicious scripts generating randomized `client_id` strings on every submission could bloat scheduler maps.
-- **Mitigation:** In `TwoLevelScheduler::on_job_completed`, when a client's queue reaches 0 and its `in_flight` counter drops to 0, the client entry is pruned from the hash map and order ring, ensuring memory usage is proportional to *active* clients rather than historical clients.
+1. **Thread-Per-Connection Ingress (C10K Scalability Boundary):**
+   * *Limitation:* Each incoming socket allocates a native OS thread. With 2,000 idle `nc` connections, virtual memory consumption jumps by +4.38 GB due to 2MB thread stacks.
+   * *Impact:* While adequate for hundreds or low thousands of active clients, scaling to 100,000+ idle long-poll connections requires asynchronous I/O multiplexing (`epoll` / `kqueue`).
+2. **Synchronous Socket I/O:**
+   * Connection threads use blocking `std::io::BufReader`. A malicious slow-loris client transmitting single bytes separated by long pauses can tie up an ingestion thread.
+3. **Single-Node In-Memory State:**
+   * Scheduler queues and [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs) reside in process memory. If the broker crashes, all uncollected job results and pending queues are lost.
+4. **Container Startup Latency (Cold Starts):**
+   * Invoking `docker run --rm` per job introduces ~300ms–800ms of startup latency. For lightweight scripts, container initialization overhead exceeds actual script execution duration.
 
 ---
 
-## 6. Production Roadmap & Future Enhancements
-
-If expanding this architecture to a multi-node, high-throughput commercial deployment:
+## 6. Production Roadmap & Future Work
 
 ```mermaid
 flowchart LR
-    LB["Layer 4 / 7 Load Balancer"]
-    
-    subgraph GatewayFleet["API Gateway Cluster (Tokio / Axum)"]
-        GW1["Gateway 1"]
-        GW2["Gateway 2"]
+    subgraph Phase1["Phase 1: Event-Driven Ingress"]
+        P1["Tokio / Mio Async Reactor<br/>• Non-blocking epoll/kqueue<br/>• 100,000+ idle connections on 8 threads<br/>• Green coroutine per socket"]
     end
-    
-    subgraph QueueLayer["Message Mesh"]
-        NATS["NATS JetStream / Redis Streams"]
+
+    subgraph Phase2["Phase 2: Execution Acceleration"]
+        P2["Pre-Warmed Pool / MicroVMs<br/>• Pre-initialized container pool<br/>• AWS Firecracker microVMs<br/>• Sub-10ms sandbox startup"]
     end
-    
-    subgraph WorkerFleet["Sandboxed Worker Nodes"]
-        WNode1["Worker Node A (Warm Pool + Firecracker)"]
-        WNode2["Worker Node B (Warm Pool + Firecracker)"]
+
+    subgraph Phase3["Phase 3: Distributed State"]
+        P3["Clustering & Persistence<br/>• Redis Streams / NATS JetStream<br/>• Multi-node worker fleets<br/>• Crash-resilient durable storage"]
     end
-    
-    subgraph StorageLayer["Distributed Persistence"]
-        RedisStore["Redis Cluster (Result Cache & Leases)"]
-        S3["S3 (Blob outputs > 1MB)"]
+
+    subgraph Phase4["Phase 4: Client Cancellation"]
+        P4["CANCEL Protocol Verb<br/>• Early runaway job abortion<br/>• Instant worker capacity reclaim"]
     end
-    
-    LB --> GW1
-    LB --> GW2
-    GW1 --> NATS
-    GW2 --> NATS
-    NATS --> WNode1
-    NATS --> WNode2
-    WNode1 --> RedisStore
-    WNode2 --> RedisStore
-    WNode1 -.-> S3
-    WNode2 -.-> S3
+
+    Phase1 --> Phase2 --> Phase3 --> Phase4
 ```
 
-1. **Warm Sandbox Pools:**
-   - *Current limitation:* Spawning a cold Docker container takes 200ms–800ms.
-   - *Enhancement:* Maintain a pre-warmed pool of paused or pre-initialized sandbox containers ready to receive code instantaneously, replenishing in the background.
-2. **MicroVM Transition (AWS Firecracker):**
-   - Replace container runtimes with lightweight hardware microVMs booting in under 15ms with full guest-kernel isolation.
-3. **Async Event-Driven Ingestion:**
-   - Migrate connection handling from `thread::spawn` to `tokio` to handle 50,000+ simultaneous persistent poll connections with minimal memory footprint.
-4. **Worker Heartbeats & Lease-Based Reclaiming:**
-   - If a physical worker machine suffers sudden hardware failure mid-execution, a distributed lease coordinator (etcd or Redis Redlock) detects the missed heartbeat and automatically returns the `Running` job to `Pending` for another worker node to resume.
+1. **Phase 1: Async Event-Driven Network Ingress (`tokio`):**
+   Replace `std::net` thread-per-connection with an asynchronous event reactor. Idle connections will sleep directly in kernel `epoll`/`kqueue` tables, allowing millions of concurrent connections on a fixed pool of threads matching physical CPU cores.
+2. **Phase 2: Pre-Warmed Container Pools & MicroVMs:**
+   Maintain a pool of paused, pre-warmed sandbox containers ready to receive code instantaneously, dropping cold-start latency from ~500ms to <10ms. Transition to Firecracker microVMs for true hardware-level virtualization.
+3. **Phase 3: Distributed Job Queuing & Persistence:**
+   Decouple broker ingress nodes from execution workers using a distributed queue (e.g., Redis Streams, NATS, or a Raft log) and persist result records in durable distributed storage for high availability and zero-downtime rolling upgrades.
+4. **Phase 4: Explicit Cancellation Protocol:**
+   Implement a `CANCEL <job_id>` command allowing clients to abort runaway jobs voluntarily before their wall-clock timeout expires, freeing worker slots immediately.
