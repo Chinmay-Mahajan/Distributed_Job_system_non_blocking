@@ -167,6 +167,10 @@ pub enum ServerResponse {
         queued_jobs: usize,
         in_flight_jobs: usize,
         stored_results: usize,
+        #[serde(default)]
+        dispatchable_clients: usize,
+        #[serde(default)]
+        waiting_clients: usize,
     },
     Error {
         status: String,

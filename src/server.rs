@@ -33,7 +33,7 @@ impl BrokerServer {
             SandboxType::Mock => Arc::new(MockSandbox),
         };
 
-        let scheduler = Arc::new(TwoLevelScheduler::new(config.max_in_flight_per_client));
+        let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
         let result_store = Arc::new(ResultStore::new(config.result_ttl));
         let shutdown = Arc::new(AtomicBool::new(false));
 
@@ -71,9 +71,12 @@ impl BrokerServer {
             listener.local_addr()?
         );
         println!(
-            "Configuration: workers={}, max_in_flight_per_client={}, sandbox={:?}, ttl={:?}",
+            "Configuration: workers={}, max_in_flight={}, queue_limit={:?} (mult={}), two_queue={}, sandbox={:?}, ttl={:?}",
             self.config.worker_count,
             self.config.max_in_flight_per_client,
+            self.config.enable_queue_limit,
+            self.config.queue_limit_multiplier,
+            self.config.enable_two_queue_scheduler,
             self.config.sandbox_type,
             self.config.result_ttl
         );
@@ -175,15 +178,20 @@ fn handle_connection(
                 let job_id = Uuid::new_v4().to_string();
                 let job = Job::new(job_id.clone(), client, language, code, stdin, timeout);
 
-                // Insert into result store as Pending
-                result_store.insert_pending(&job);
+                match scheduler.submit(job.clone()) {
+                    Ok(()) => {
+                        // Insert into result store as Pending only if admitted
+                        result_store.insert_pending(&job);
 
-                // Enqueue into scheduler
-                scheduler.submit(job);
-
-                // Return opaque job_id immediately without blocking!
-                let resp = format_submit_ok(&job_id, parsed.format);
-                writer.write_all(resp.as_bytes())?;
+                        // Return opaque job_id immediately without blocking!
+                        let resp = format_submit_ok(&job_id, parsed.format);
+                        writer.write_all(resp.as_bytes())?;
+                    }
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes())?;
+                    }
+                }
             }
 
             ClientCommand::Poll { job_id } => {

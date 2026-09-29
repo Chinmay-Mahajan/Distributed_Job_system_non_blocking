@@ -232,3 +232,77 @@ fn test_e2e_multi_client_fairness_under_contention() {
 
     assert!(b_completed, "Client B should not be starved by Client A's batch");
 }
+
+#[test]
+fn test_e2e_rate_limiting_rejection() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr").to_string();
+
+    let config = Config {
+        bind_address: addr.clone(),
+        worker_count: 1,
+        max_in_flight_per_client: 1,
+        enable_queue_limit: true,
+        queue_limit_multiplier: 2, // max queued = 1 * 2 = 2
+        sandbox_type: SandboxType::Local,
+        default_timeout_secs: 5,
+        result_ttl: Duration::from_secs(60),
+        cleanup_interval: Duration::from_millis(50),
+        ..Config::default()
+    };
+
+    let server = Arc::new(BrokerServer::new(config));
+    let server_clone = Arc::clone(&server);
+
+    thread::spawn(move || {
+        let _ = server_clone.run_listener(listener);
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+
+    // Submit 3 jobs quickly:
+    // Job 1 is popped and runs (sleep 0.5s) -> in_flight = 1
+    // Job 2 is queued -> queued = 1
+    // Job 3 is queued -> queued = 2 (reaches capacity limit of 1 * 2 = 2)
+    for i in 1..=3 {
+        let req = serde_json::json!({
+            "action": "SUBMIT",
+            "client_id": "greedy-client",
+            "language": "python",
+            "code": "import time; time.sleep(0.5)",
+        });
+        writeln!(stream, "{}", req).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let resp: ServerResponse = serde_json::from_str(line.trim()).expect("parse ok");
+        match resp {
+            ServerResponse::SubmitOk { .. } => {}
+            other => panic!("Expected SubmitOk for job {}, got {:?}", i, other),
+        }
+    }
+
+    // Submit 4th job immediately: while 2 are queued and 1 in-flight, must be rejected!
+    let req4 = serde_json::json!({
+        "action": "SUBMIT",
+        "client_id": "greedy-client",
+        "language": "python",
+        "code": "import time; time.sleep(0.5)",
+    });
+    writeln!(stream, "{}", req4).unwrap();
+    let mut line4 = String::new();
+    reader.read_line(&mut line4).unwrap();
+
+    let resp4: ServerResponse = serde_json::from_str(line4.trim()).expect("parse error resp");
+    match resp4 {
+        ServerResponse::Error { error, .. } => {
+            assert!(error.contains("Rate limit exceeded"));
+            assert!(error.contains("greedy-client"));
+        }
+        other => panic!("Expected Error response for job 4, got {:?}", other),
+    }
+
+    server.shutdown();
+}

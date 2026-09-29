@@ -25,6 +25,9 @@ pub struct Config {
     pub docker_cpus: String,
     pub docker_pids_limit: u64,
     pub docker_tmpfs_size: String,
+    pub enable_queue_limit: bool,
+    pub queue_limit_multiplier: usize,
+    pub enable_two_queue_scheduler: bool,
 }
 
 impl Default for Config {
@@ -35,7 +38,7 @@ impl Default for Config {
             max_in_flight_per_client: 2, // max num of current running jobs for each client 
             default_timeout_secs: 10, //  wall clock time for a single job (running) 
             max_timeout_secs: 60,
-            result_ttl: Duration::from_secs(600), // 10 minutes (per plan.md §2.6) WE DONT WANT RESULTS TO STAY IN THE MEMORY FOREVER !! 
+            result_ttl: Duration::from_secs(600), // 10 minutes (per plan.md §2.6) WE DONT WANT RESULTS TO STAY IN THE MEMORY FOREVER ! 
             cleanup_interval: Duration::from_secs(30), // A background thread clears the entries in the store with time elapsed > result_ttl
             sandbox_type: SandboxType::Docker,
             docker_runtime: std::env::var("DISTJOB_DOCKER_RUNTIME").ok(), // e.g. "runsc"
@@ -43,6 +46,9 @@ impl Default for Config {
             docker_cpus: "0.5".to_string(),
             docker_pids_limit: 64,
             docker_tmpfs_size: "64m".to_string(),
+            enable_queue_limit: true,
+            queue_limit_multiplier: 5,
+            enable_two_queue_scheduler: true,
         }
     }
 }
@@ -70,6 +76,15 @@ impl Config {
         }
         if let Ok(Ok(val)) = std::env::var("DISTJOB_TTL_SECS").map(|t| t.parse::<u64>()) {
             config.result_ttl = Duration::from_secs(val);
+        }
+        if let Ok(val) = std::env::var("DISTJOB_ENABLE_QUEUE_LIMIT") {
+            config.enable_queue_limit = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_QUEUE_LIMIT_MULTIPLIER").map(|m| m.parse::<usize>()) {
+            config.queue_limit_multiplier = val;
+        }
+        if let Ok(val) = std::env::var("DISTJOB_ENABLE_TWO_QUEUE_SCHEDULER") {
+            config.enable_two_queue_scheduler = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
         }
 
         config

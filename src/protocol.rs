@@ -159,12 +159,19 @@ pub fn format_stats(
                 queued_jobs: stats.queued_jobs,
                 in_flight_jobs: stats.in_flight_jobs,
                 stored_results,
+                dispatchable_clients: stats.dispatchable_clients,
+                waiting_clients: stats.waiting_clients,
             };
             format!("{}\n", serde_json::to_string(&resp).unwrap())
         }
         ProtocolFormat::Text => format!(
-            "+OK active_clients={} queued={} in_flight={} stored_results={}\r\n",
-            stats.active_clients, stats.queued_jobs, stats.in_flight_jobs, stored_results
+            "+OK active_clients={} queued={} in_flight={} stored_results={} dispatchable={} waiting={}\r\n",
+            stats.active_clients,
+            stats.queued_jobs,
+            stats.in_flight_jobs,
+            stored_results,
+            stats.dispatchable_clients,
+            stats.waiting_clients
         ),
     }
 }
