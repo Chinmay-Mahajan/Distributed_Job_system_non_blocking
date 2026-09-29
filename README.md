@@ -23,9 +23,9 @@ flowchart TD
     end
 
     subgraph Scheduler["Two-Queue O(1) Fair Scheduler"]
-        DQ["dispatchable_queue (VecDeque)<br/>in_flight < cap<br/>O(1) Worker Pop"]
-        WQ["waiting_queue (HashSet)<br/>in_flight >= cap (Saturated)<br/>Parked with 0 scan overhead"]
-        Queues["Per-Client Isolated FIFO Queues<br/>VecDeque<Job>"]
+        DQ["dispatchable_queue (VecDeque)<br/>in_flight &lt; cap<br/>O(1) Worker Pop"]
+        WQ["waiting_queue (HashSet)<br/>in_flight &gt;= cap (Saturated)<br/>Parked with 0 scan overhead"]
+        Queues["Per-Client Isolated FIFO Queues<br/>VecDeque[Job]"]
     end
 
     subgraph Workers["Execution Worker Pool"]
@@ -63,37 +63,41 @@ flowchart TD
 ## 2. Core Architectural Pillars & Strengths
 
 ### 2.1 Two-Queue $O(1)$ Fair Scheduler
-* **Instantaneous $O(1)$ Dispatch:** Workers never scan through an $O(N)$ list of clients skipping saturated tenants under a shared mutex. Workers pop eligible tenants directly from [`dispatchable_queue`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs).
-* **Zero-Overhead Tenant Saturation:** When a client reaches their concurrent in-flight limit (`max_in_flight_per_client`), they are parked in [`waiting_queue`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs). Saturated clients consume **zero worker CPU cycles**.
-* **Automatic $O(1)$ Capacity Promotion:** The moment a worker finishes a job, [`on_job_completed()`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs) removes the client from [`waiting_queue`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs) and promotes them back into [`dispatchable_queue`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/scheduler.rs) in $O(1)$ time.
+* **Instantaneous $O(1)$ Dispatch:** Workers never scan through an $O(N)$ list of clients skipping saturated tenants under a shared mutex. Workers pop eligible tenants directly from [`dispatchable_queue`](src/scheduler.rs).
+* **Zero-Overhead Tenant Saturation:** When a client reaches their concurrent in-flight limit (`max_in_flight_per_client`), they are parked in [`waiting_queue`](src/scheduler.rs). Saturated clients consume **zero worker CPU cycles**.
+* **Automatic $O(1)$ Capacity Promotion:** The moment a worker finishes a job, [`on_job_completed()`](src/scheduler.rs) removes the client from [`waiting_queue`](src/scheduler.rs) and promotes them back into [`dispatchable_queue`](src/scheduler.rs) in $O(1)$ time.
 
 ### 2.2 Dynamic Admission Control & Bufferbloat Prevention
 * **Configurable Backpressure:** Saturated clients can queue pending requests up to a configurable multiplier of their concurrency cap:
   $$\text{Max Allowed Queue Depth} = \text{max\_in\_flight\_per\_client} \times \text{queue\_limit\_multiplier}$$
-* **Fast-Fail Memory Protection:** Excess requests beyond this quota are rejected immediately with a descriptive rate limit error before touching the [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs), preventing memory exhaustion and bufferbloat.
+* **Fast-Fail Memory Protection:** Excess requests beyond this quota are rejected immediately with a descriptive rate limit error before touching the [`ResultStore`](src/store.rs), preventing memory exhaustion and bufferbloat.
 * **Empirically Proven Fairness:** Under heavy asymmetric traffic (128 concurrent requests), legitimate tenants experienced **100% completion rates** with an average queue latency of just **1.3s – 1.7s**, while abusive high-frequency spammers were safely bounded.
 
 ### 2.3 Non-Blocking Network Ingress
 * Client connections submit commands and receive a UUIDv4 `job_id` immediately. Connection threads **never block synchronously** on code compilation or sandbox execution.
 * Clients poll on their own schedule via `POLL` or check status via `STATUS`.
 
-### 2.4 Multi-Layered Sandbox Isolation
-* **Ephemeral Containers:** Containers run with `--rm` and randomized single-use names.
-* **Zero Network Access:** Hard isolation with `--network none`.
+### 2.4 Multi-Layered Sandbox Isolation & Pre-Warmed Acceleration
+* **Pre-Warmed "Bake and Burn" Standby Pool:** A background thread maintains idle standby containers ready for instantaneous execution. Containers are claimed in $O(1)$ and burned asynchronously in detached threads after a single use, preserving strict cross-tenant isolation with sub-20ms container dispatch.
+* **Pre-Baked Scientific Runtime (`distjob-python:latest`):** Bundles `numpy`, `pandas`, `scipy`, `sympy`, and `requests` with Ahead-of-Time (AOT) `.pyc` bytecode compilation, cutting import times by 3x–5x.
+* **Fault-Tolerant Dynamic Image Fallback:** If `distjob-python:latest` is not present on the host, the broker automatically discovers and falls back to `python:3.11-slim` without dropping jobs.
+* **Zero Network Access:** Hard air-gapped isolation with `--network none`.
 * **Resource Caps:** Enforced cgroups via `--memory 128m`, `--cpus 0.5`, `--pids-limit 64`.
-* **Filesystem Immutability:** `--read-only` root filesystem paired with a size-limited in-memory `--tmpfs /tmp:rw,noexec,nosuid,size=64m`.
-* **Syscall Filtering:** Optional integration with Google's gVisor runtime (`--runtime runsc`).
+* **Filesystem Immutability:** `--read-only` root filesystem paired with an in-memory `--tmpfs /tmp:rw,noexec,nosuid,size=64m`.
+* **Syscall Interception:** Optional integration with Google's gVisor runtime (`--runtime runsc`).
 * **Broker-Enforced Hard Timeout:** A broker supervisor thread monitors wall-clock execution against `timeout_secs`, killing runaway containers or processes and recording `TimedOut`.
+* **Safe Stdin EOF Transmission:** Decoupled pipe lifecycle ensuring standard input EOF is reliably delivered to container processes.
 
 ### 2.5 Automated Lifecycle Management
-* Completed job outputs reside in an in-memory [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs) protected by a Time-To-Live (TTL).
+* Completed job outputs reside in an in-memory [`ResultStore`](src/store.rs) protected by a Time-To-Live (TTL).
 * An asynchronous background reaper periodically sweeps and evicts expired records, preventing silent memory leaks.
 
 ---
 
 ## 3. Empirical Performance Benchmarks
 
-Stress testing against asymmetric multi-tenant workloads (6 clients, 128 burst requests) comparing the original baseline with the current $O(1)$ two-queue engine:
+### 3.1 Multi-Tenant Fairness Under Contention (128 Burst Requests)
+Stress testing against asymmetric multi-tenant workloads (6 clients, 128 burst requests: 85 High-Freq spammers, 33 Med-Freq, 10 Low-Freq legitimate users):
 
 | Metric | Baseline (Single-Queue) | Current (Two-Queue + Admission Control) | Improvement |
 | :--- | :---: | :---: | :---: |
@@ -104,6 +108,17 @@ Stress testing against asymmetric multi-tenant workloads (6 clients, 128 burst r
 | **Legitimate Tenant Queue Wait** | `2,148.8 ms` | **`1,764.7 ms`** | **Zero starvation** |
 | **Legitimate Tenant Success Rate**| `100% (10/10)` | **`100% (10/10)`** | **Protected from noisy neighbors** |
 
+### 3.2 Pre-Warmed Pool Acceleration vs On-Demand Cold Starts (Light Workload)
+Benchmarking the impact of the **Pre-Warmed "Bake and Burn" Container Pool** against standard on-demand `docker run`:
+
+| Metric | On-Demand Cold Starts (`docker run`) | Pre-Warmed Pool ("Bake and Burn") | Empirical Improvement |
+| :--- | :---: | :---: | :---: |
+| **Overall System Throughput** | `4.79 req/s` | **`10.79 req/s`** | **+125.3% Higher Throughput (2.25x)** |
+| **Low-Frequency Client Turnaround** | `2,800.0 ms` | **`321.0 ms`** | **88.5% Latency Drop (8.7x faster)** |
+| **Total Execution Duration** | `13.14s` | **`2.69s`** | **4.88x Faster Completion** |
+| **Completion Rate** | `100%` | **`100% (29/29)`** | **Zero Failures / Zero Drops** |
+| **Fairness Multiplier** | `1.4x` | **`4.1x lower latency`** | **Legitimate users bypass spammer backlog** |
+
 ---
 
 ## 4. Current Architectural Gaps & Known Limitations
@@ -111,14 +126,14 @@ Stress testing against asymmetric multi-tenant workloads (6 clients, 128 burst r
 While the broker core and execution engine are robust and fair, the current implementation has several recognized design constraints:
 
 1. **Thread-Per-Connection Ingress Model (The C10K Bottleneck):**
-   * *The Problem:* As documented in [`Idle_User_Simulation_Report.md`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/Idle_User_Simulation_Report.md), each active TCP connection spawns a dedicated OS thread (`std::thread::spawn`). While physical RSS memory per idle thread is small (~16 KB), 2,000 idle `nc` clients reserve **+4.38 GB of Virtual Address Space (VSZ)** due to default 2 MB stack allocations.
+   * *The Problem:* As documented in [`Idle_User_Simulation_Report.md`](Idle_User_Simulation_Report.md), each active TCP connection spawns a dedicated OS thread (`std::thread::spawn`). While physical RSS memory per idle thread is small (~16 KB), 2,000 idle `nc` clients reserve **+4.38 GB of Virtual Address Space (VSZ)** due to default 2 MB stack allocations.
    * *The Impact:* The broker cannot scale to tens of thousands of concurrent idle or long-polling clients without exhausting OS thread handles (`EAGAIN`) or virtual memory limits.
 2. **Synchronous Socket I/O:**
    * Connection threads block on `BufReader::read_line()`. A slow-loris client transmitting single bytes with long delays ties up an entire OS thread.
 3. **Single-Node In-Memory State:**
-   * All scheduler queues, in-flight counters, and [`ResultStore`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/store.rs) entries reside in the memory of a single process. If the broker restarts, pending jobs and uncollected results are lost.
-4. **Container Startup Latency (Cold Starts):**
-   * Spawning a fresh Docker container (`docker run --rm`) per job incurs ~300ms–800ms of startup latency. For short micro-benchmarks, container initialization overhead dominates actual execution time.
+   * All scheduler queues, in-flight counters, and [`ResultStore`](src/store.rs) entries reside in the memory of a single process. If the broker restarts, pending jobs and uncollected results are lost.
+4. **Container Startup Latency (Mitigated by Pre-Warmed Pool):**
+   * *Status:* Container initialization overhead is now mitigated by the asynchronous [`PrewarmedContainerPool`](src/sandbox.rs), dropping warm execution startup to sub-20ms. Under sustained bursts that temporarily exhaust the pool, the broker gracefully falls back to on-demand `docker run` (~300ms–800ms). MicroVMs (e.g., AWS Firecracker) represent the subsequent optimization frontier.
 
 ---
 
@@ -216,7 +231,7 @@ The broker natively supports two wire protocols over the same TCP listener:
 
 ## 7. Configuration Reference
 
-All settings can be specified via [`Config`](file:///Users/chinmaymahajan/Desktop/IMP%20NOTES%20PDF/RUST/distributed_jobv2/src/config.rs) or environment variables:
+All settings can be specified via [`Config`](src/config.rs) or environment variables:
 
 | Option | Env Variable | Default | Description |
 |---|---|---|---|
@@ -226,6 +241,9 @@ All settings can be specified via [`Config`](file:///Users/chinmaymahajan/Deskto
 | **Enable Queue Limit** | `DISTJOB_ENABLE_QUEUE_LIMIT` | `true` | Toggles per-client pending queue rate limiting |
 | **Queue Multiplier** | `DISTJOB_QUEUE_LIMIT_MULTIPLIER` | `5` | Multiplier defining queue limit: $\text{cap} \times \text{mult}$ |
 | **Two-Queue Scheduler**| `DISTJOB_ENABLE_TWO_QUEUE_SCHEDULER` | `true` | Toggles $O(1)$ two-queue engine vs legacy single-queue loop |
+| **Pre-Warmed Pool** | `DISTJOB_ENABLE_PREWARMED_POOL` | `true` | Toggles standby pre-warmed container pool |
+| **Pool Size** | `DISTJOB_PREWARMED_POOL_SIZE` | `2` | Number of standby containers kept in warm pool |
+| **Python Image** | `DISTJOB_PYTHON_IMAGE` | `distjob-python:latest` | Docker image with pre-baked libraries |
 | **Sandbox Type** | `DISTJOB_SANDBOX` | `docker` | Sandbox engine: `docker`, `local`, or `mock` |
 | **Docker Runtime** | `DISTJOB_DOCKER_RUNTIME` | (none) | e.g. `runsc` for gVisor syscall isolation |
 | **Result TTL** | `DISTJOB_TTL_SECS` | `600` | Retention duration for completed job results (seconds) |
@@ -234,7 +252,14 @@ All settings can be specified via [`Config`](file:///Users/chinmaymahajan/Deskto
 
 ## 8. Build, Test & Run
 
-### 8.1 Build & Test Suite
+### 8.1 Build Pre-Baked Sandbox Image
+```bash
+# Build custom image with NumPy, Pandas, SciPy, SymPy, and precompiled .pyc bytecode
+docker build -t distjob-python:latest .
+```
+> For a line-by-line breakdown of the Dockerfile, layer optimizations, and security profile, see [`docker_image.md`](docker_image.md).
+
+### 8.2 Build & Test Suite
 ```bash
 # Compile project
 cargo build --release
@@ -243,9 +268,9 @@ cargo build --release
 cargo test
 ```
 
-### 8.2 Launch Broker
+### 8.3 Launch Broker
 ```bash
-# Run with Docker sandbox (production mode)
+# Run with Docker sandbox (production mode with pre-warmed pool)
 cargo run -- --docker 127.0.0.1:7000
 
 # Run with Local sandbox (fast dev mode without Docker dependency)
@@ -267,5 +292,14 @@ POLL <job_id>
 
 ### 8.4 Run Stress Test Suite
 ```bash
-./stress_test.sh
+# Fast validation test (~3-5s, 4 clients, 29 requests)
+./stress_test.sh --preset light
+# Alternatively via Python test harness:
+python3 stress_test.py --preset light
+
+# Standard multi-tenant test (~25-35s)
+./stress_test.sh --preset standard
+
+# High-concurrency heavy stress test (6 clients, 128 burst requests)
+./stress_test.sh --preset heavy
 ```

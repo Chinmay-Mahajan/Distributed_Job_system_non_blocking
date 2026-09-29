@@ -304,7 +304,7 @@ def main():
     parser.add_argument("--port", type=int, default=7000, help="Broker server port (default: 7000)")
     parser.add_argument(
         "--preset",
-        choices=["quick", "standard", "heavy"],
+        choices=["quick", "light", "standard", "heavy"],
         default="standard",
         help="Predefined traffic profile (default: standard)",
     )
@@ -366,6 +366,7 @@ def main():
             ("client_slow_2", "Low-Freq", 4, 1.60, 50),
         ],
     }
+    profiles["light"] = profiles["quick"]
 
     client_configs = profiles[args.preset]
     print(f"Running Traffic Simulation Preset '{args.preset}' with {len(client_configs)} clients:")

@@ -240,6 +240,7 @@ impl TwoLevelScheduler {
 
         if let Some(count) = inner.client_in_flight.get_mut(client_id) {
             *count = count.saturating_sub(1);
+            // count is a mut ref to usize which evals to u64 / u32 based on the machine's architecture. so we must saturate (stop) the subtraction when the result is about to underflow. 
         }
 
         let in_flight = inner.client_in_flight.get(client_id).copied().unwrap_or(0);

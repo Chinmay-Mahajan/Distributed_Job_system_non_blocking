@@ -28,6 +28,9 @@ pub struct Config {
     pub enable_queue_limit: bool,
     pub queue_limit_multiplier: usize,
     pub enable_two_queue_scheduler: bool,
+    pub enable_prewarmed_pool: bool,
+    pub prewarmed_pool_size: usize,
+    pub docker_python_image: String,
 }
 
 impl Default for Config {
@@ -49,6 +52,9 @@ impl Default for Config {
             enable_queue_limit: true,
             queue_limit_multiplier: 5,
             enable_two_queue_scheduler: true,
+            enable_prewarmed_pool: true,
+            prewarmed_pool_size: 2,
+            docker_python_image: "distjob-python:latest".to_string(),
         }
     }
 }
@@ -85,6 +91,15 @@ impl Config {
         }
         if let Ok(val) = std::env::var("DISTJOB_ENABLE_TWO_QUEUE_SCHEDULER") {
             config.enable_two_queue_scheduler = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
+        }
+        if let Ok(val) = std::env::var("DISTJOB_ENABLE_PREWARMED_POOL") {
+            config.enable_prewarmed_pool = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_PREWARMED_POOL_SIZE").map(|s| s.parse::<usize>()) {
+            config.prewarmed_pool_size = val;
+        }
+        if let Ok(img) = std::env::var("DISTJOB_PYTHON_IMAGE") {
+            config.docker_python_image = img;
         }
 
         config

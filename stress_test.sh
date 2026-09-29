@@ -314,7 +314,7 @@ echo -e "${BOLD}Configuring Traffic Simulation (Preset: ${PRESET})...${NC}"
 declare -a CLIENT_LIST
 
 case "$PRESET" in
-    quick)
+    quick|light)
         # ~10-15 seconds
         CLIENT_LIST=(
             "client_spammer_1:High-Freq:12:0.06:40"
