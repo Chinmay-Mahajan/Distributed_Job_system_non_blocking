@@ -39,6 +39,7 @@ impl From<SandboxExecutionResult> for crate::store::ExecutionOutcome {
 
 pub trait Sandbox: Send + Sync {
     fn execute(&self, job: &Job) -> SandboxExecutionResult;
+    fn shutdown(&self) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -90,6 +91,18 @@ pub struct PrewarmedContainerPool {
 
 impl PrewarmedContainerPool {
     pub fn start(config: &Config) -> Arc<Self> {
+        // Clean up any orphan containers from previous unclean shutdowns
+        if let Ok(output) = Command::new("docker")
+            .args(["ps", "-aq", "--filter", "name=distjob-warm-"])
+            .output()
+        {
+            let raw = String::from_utf8_lossy(&output.stdout);
+            let ids: Vec<&str> = raw.split_whitespace().collect();
+            if !ids.is_empty() {
+                let _ = Command::new("docker").arg("rm").arg("-f").args(&ids).output();
+            }
+        }
+
         let shutdown = Arc::new(AtomicBool::new(false));
         let effective_image = resolve_effective_image(&config.docker_python_image);
         let pool = Arc::new(Self {
@@ -213,15 +226,15 @@ impl PrewarmedContainerPool {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.condvar.notify_all();
+        if let Some(handle) = self.replenish_thread.lock().unwrap().take() {
+            let _ = handle.join();
+        }
     }
 }
 
 impl Drop for PrewarmedContainerPool {
     fn drop(&mut self) {
         self.shutdown();
-        if let Some(handle) = self.replenish_thread.lock().unwrap().take() {
-            let _ = handle.join();
-        }
     }
 }
 
@@ -645,6 +658,12 @@ impl Sandbox for DockerSandbox {
 
         // On-demand path: docker run --rm
         self.execute_on_demand(job, start, timeout)
+    }
+
+    fn shutdown(&self) {
+        if let Some(pool) = &self.pool {
+            pool.shutdown();
+        }
     }
 }
 

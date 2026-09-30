@@ -23,6 +23,7 @@ pub struct BrokerServer {
     worker_pool: std::sync::Mutex<Option<WorkerPool>>,
     reaper_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub shutdown: Arc<AtomicBool>,
+    pub sandbox: Arc<dyn Sandbox>,
 }
 
 impl BrokerServer {
@@ -34,7 +35,7 @@ impl BrokerServer {
         };
 
         let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
-        let result_store = Arc::new(ResultStore::new(config.result_ttl));
+        let result_store = Arc::new(ResultStore::with_shards(config.result_ttl, config.store_shards));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Start background result reaper
@@ -50,7 +51,7 @@ impl BrokerServer {
             config.worker_count,
             Arc::clone(&scheduler),
             Arc::clone(&result_store),
-            sandbox,
+            Arc::clone(&sandbox),
         );
 
         Self {
@@ -60,6 +61,7 @@ impl BrokerServer {
             worker_pool: std::sync::Mutex::new(Some(worker_pool)),
             reaper_handle: std::sync::Mutex::new(Some(reaper_handle)),
             shutdown,
+            sandbox,
         }
     }
 
@@ -117,6 +119,7 @@ impl BrokerServer {
         if let Some(reaper) = self.reaper_handle.lock().ok().and_then(|mut l| l.take()) {
             let _ = reaper.join();
         }
+        self.sandbox.shutdown();
     }
 }
 

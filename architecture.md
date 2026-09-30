@@ -282,13 +282,16 @@ Result management lives in [`src/store.rs`](src/store.rs).
  └─────────┘└─────────┘└──────────┘
 ```
 
-#### Memory Management with TTL:
+#### Memory Management with TTL & Lock Sharding:
 Without an expiration mechanism, clients that submit jobs but never poll would cause unbound memory growth.
 - Every entry in `ResultStore` is stamped with an `expires_at = Instant::now() + TTL` (default: 600s / 10 minutes).
 - **Two-Tier Purging:**
   - **Passive Purge on Read:** If `get(job_id)` is invoked after expiry, the entry is immediately evicted and returns `None`.
   - **Active Background Janitor:** A lightweight background thread awakens every `cleanup_interval` (default: 30s) and scans the store, pruning stale entries.
-- **Read-Write Locking (`RwLock`):** Read-heavy `POLL` requests acquire shared locks simultaneously without blocking one another.
+- **Lock Sharding (Striping) with `RwLock`:**
+  - Instead of a single monolithic lock, entries are striped across $S=32$ independent shards: $\text{shard} = \text{hash}(\text{job\_id}) \ \& \ (S - 1)$.
+  - Writes (job completions, status transitions) only lock the specific shard holding that `job_id`, leaving all other shards unblocked.
+  - The janitor thread prunes one shard at a time sequentially, eliminating the global stop-the-world "reaper freeze" across polling threads.
 
 ---
 

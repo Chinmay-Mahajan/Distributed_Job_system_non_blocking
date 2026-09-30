@@ -88,9 +88,9 @@ flowchart TD
 * **Broker-Enforced Hard Timeout:** A broker supervisor thread monitors wall-clock execution against `timeout_secs`, killing runaway containers or processes and recording `TimedOut`.
 * **Safe Stdin EOF Transmission:** Decoupled pipe lifecycle ensuring standard input EOF is reliably delivered to container processes.
 
-### 2.5 Automated Lifecycle Management
-* Completed job outputs reside in an in-memory [`ResultStore`](src/store.rs) protected by a Time-To-Live (TTL).
-* An asynchronous background reaper periodically sweeps and evicts expired records, preventing silent memory leaks.
+### 2.5 Automated Lifecycle Management & Lock Sharding
+* Completed job outputs reside in an in-memory, lock-striped [`ResultStore`](src/store.rs) partitioned into 32 independent shards, eliminating lock contention between concurrent worker writes and poller reads.
+* An asynchronous background reaper periodically sweeps and evicts expired records shard-by-shard, preventing stop-the-world latency spikes and memory leaks.
 
 ---
 

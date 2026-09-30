@@ -31,6 +31,7 @@ pub struct Config {
     pub enable_prewarmed_pool: bool,
     pub prewarmed_pool_size: usize,
     pub docker_python_image: String,
+    pub store_shards: usize,
 }
 
 impl Default for Config {
@@ -53,8 +54,9 @@ impl Default for Config {
             queue_limit_multiplier: 5,
             enable_two_queue_scheduler: true,
             enable_prewarmed_pool: true,
-            prewarmed_pool_size: 2,
+            prewarmed_pool_size: 4,
             docker_python_image: "distjob-python:latest".to_string(),
+            store_shards: crate::store::DEFAULT_SHARDS,
         }
     }
 }
@@ -100,6 +102,9 @@ impl Config {
         }
         if let Ok(img) = std::env::var("DISTJOB_PYTHON_IMAGE") {
             config.docker_python_image = img;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_STORE_SHARDS").map(|s| s.parse::<usize>()) {
+            config.store_shards = val;
         }
 
         config
