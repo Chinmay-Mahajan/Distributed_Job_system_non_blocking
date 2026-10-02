@@ -307,47 +307,18 @@ impl DockerSandbox {
         start: Instant,
         timeout: Duration,
     ) -> SandboxExecutionResult {
-        let is_shell = matches!(job.language.to_lowercase().as_str(), "sh" | "bash" | "shell");
-        let (script_name, exec_binary) = if is_shell {
-            ("script.sh", "sh")
-        } else {
-            ("script.py", "python3")
+        let (exec_binary, flag) = match job.language.to_lowercase().as_str() {
+            "sh" | "bash" | "shell" => ("sh", "-c"),
+            "node" | "javascript" | "js" => ("node", "-e"),
+            _ => ("python3", "-c"),
         };
 
-        let container_script_path = format!("/tmp/{}", script_name);
-
-        // 1. Stage the script into the container's tmpfs via stdin pipe to cat
-        let mut stage_cmd = Command::new("docker");
-        stage_cmd
-            .args(["exec", "-i", container_name, "sh", "-c", &format!("cat > {}", container_script_path)])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped());
-
-        let stage_ok = (|| -> std::io::Result<bool> {
-            let mut child = stage_cmd.spawn()?;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(job.code.as_bytes())?;
-            }
-            let status = child.wait()?;
-            Ok(status.success())
-        })().unwrap_or(false);
-
-        if !stage_ok {
-            return SandboxExecutionResult {
-                status: JobState::Failed,
-                stdout: String::new(),
-                stderr: "Failed to stage script in pre-warmed container".to_string(),
-                exit_code: Some(1),
-                error_message: Some("Pre-warmed staging error".to_string()),
-                duration_ms: start.elapsed().as_millis() as u64,
-            };
-        }
-
-        // 2. Execute the staged script inside the warm container
+        // Single-Hop Direct Execution
+        // Passes code directly via command-line argument (`-c`), eliminating the separate
+        // staging round-trip (`cat > /tmp/...`) entirely.
         let mut exec_cmd = Command::new("docker");
         exec_cmd
-            .args(["exec", "-i", container_name, exec_binary, &container_script_path])
+            .args(["exec", "-i", container_name, exec_binary, flag, &job.code])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -376,6 +347,8 @@ impl DockerSandbox {
         let mut stdout_handle = child.stdout.take().unwrap();
         let mut stderr_handle = child.stderr.take().unwrap();
 
+        // asynch. read from the stderr and stdout buffer to prevent a buffer overflow (a deadlock)
+
         let stdout_thread = thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
@@ -392,8 +365,11 @@ impl DockerSandbox {
         let mut exit_status = None;
 
         while start.elapsed() < timeout {
+            // checking up on the child process. whether it is done .. (we cant wait forver hence the time constraint )
+            // try_wait() basically non blocking version of wait() 
             match child.try_wait() {
                 Ok(Some(status)) => {
+                    // done executing , 
                     exit_status = Some(status);
                     break;
                 }

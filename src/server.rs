@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread::JoinHandle;
 use uuid::Uuid;
 
 use crate::config::{Config, SandboxType};
@@ -94,11 +94,17 @@ impl BrokerServer {
                     let result_store = Arc::clone(&self.result_store);
                     let config = self.config.clone();
 
-                    thread::spawn(move || {
+                    let builder = std::thread::Builder::new()
+                        .name("broker-conn".into())
+                        .stack_size(256 * 1024);
+
+                    if let Err(e) = builder.spawn(move || {
                         if let Err(e) = handle_connection(stream, scheduler, result_store, config) {
                             eprintln!("Connection error: {}", e);
                         }
-                    });
+                    }) {
+                        eprintln!("Failed to spawn connection thread: {}", e);
+                    }
                 }
                 Err(e) => {
                     if !self.shutdown.load(Ordering::Relaxed) {
