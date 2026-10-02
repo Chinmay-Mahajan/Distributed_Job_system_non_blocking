@@ -1117,7 +1117,7 @@ def main():
 
     args = parser.parse_args()
 
-    # Determine tenant populations
+    # Determine tenant populations dynamically based on broker worker count
     if args.clients is not None:
         total = max(1, args.clients)
         polite = max(1, int(round(total * 0.40)))
@@ -1126,18 +1126,26 @@ def main():
         heavy = max(1, total - (polite + rapid + burst))
         spammers = args.spammers
     else:
-        # In saturation mode, default to 24 clients to fully saturate 16 workers
-        if args.mode in ("saturation", "flood") and args.polite is None and args.rapid is None:
-            polite = 10
-            rapid = 8
-            burst = 3
-            heavy = 3
+        # Dynamically scale client population to match the broker's worker capacity:
+        # In saturation/flood mode: client count = (workers + ~25% buffer)
+        # to pin 100% worker saturation without causing massive multi-second queue backlogs.
+        if args.mode in ("saturation", "flood"):
+            total = max(2, args.broker_workers + max(1, args.broker_workers // 4))
+        else:
+            # In realistic mode (think time ~1.5s): need ~3-4x workers to saturate
+            total = max(2, args.broker_workers * 3)
+
+        if args.polite is None and args.rapid is None:
+            polite = max(1, int(round(total * 0.40)))
+            rapid = max(1, int(round(total * 0.35)))
+            burst = max(1, int(round(total * 0.15)))
+            heavy = max(1, total - (polite + rapid + burst))
             spammers = args.spammers
         else:
-            polite = args.polite if args.polite is not None else 6
-            rapid = args.rapid if args.rapid is not None else 4
-            burst = args.burst if args.burst is not None else 3
-            heavy = args.heavy if args.heavy is not None else 2
+            polite = args.polite if args.polite is not None else 1
+            rapid = args.rapid if args.rapid is not None else 1
+            burst = args.burst if args.burst is not None else 1
+            heavy = args.heavy if args.heavy is not None else 1
             spammers = args.spammers
 
     run_benchmark(
