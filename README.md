@@ -73,8 +73,11 @@ flowchart TD
 * **Fast-Fail Memory Protection:** Excess requests beyond this quota are rejected immediately with a descriptive rate limit error before touching the [`ResultStore`](src/store.rs), preventing memory exhaustion and bufferbloat.
 * **Empirically Proven Fairness:** Under heavy asymmetric traffic (128 concurrent requests), legitimate tenants experienced **100% completion rates** with an average queue latency of just **1.3s – 1.7s**, while abusive high-frequency spammers were safely bounded.
 
-### 2.3 Non-Blocking Network Ingress
-* Client connections submit commands and receive a UUIDv4 `job_id` immediately. Connection threads **never block synchronously** on code compilation or sandbox execution.
+### 2.3 Dual Connection Models: Synchronous vs. Asynchronous Tokio Reactor
+The broker supports two interchangeable connection models toggleable at startup via CLI flags or environment variables:
+* **Asynchronous Tokio Reactor (`--async` / `DISTJOB_ASYNC=1`):** Uses non-blocking TCP socket multiplexing powered by Tokio (`epoll` on Linux / `kqueue` on macOS) in [`src/server_async.rs`](src/server_async.rs). Incoming client connections are handled as lightweight cooperative green tasks (~300 bytes each) on a fixed thread pool matching physical CPU cores. Idle clients and polling waits yield execution back to the kernel reactor without consuming dedicated OS threads, fully resolving the C10K connection exhaustion bottleneck.
+* **Synchronous Thread-per-Connection (`--sync`, default):** The classic, standalone implementation in [`src/server.rs`](src/server.rs) where each TCP connection is handled by a dedicated OS thread.
+* **The Hybrid Reactor Pattern:** In both models, client network ingestion is decoupled from the execution engine. Submissions immediately return an opaque `job_id`, while the heavy container sandboxes execute on dedicated background worker threads ([`WorkerPool`](src/worker.rs)), ensuring high network polling rates never starve container executions and heavy container jobs never freeze the network reactor.
 * Clients poll on their own schedule via `POLL` or check status via `STATUS`.
 
 ### 2.4 Multi-Layered Sandbox Isolation & Pre-Warmed Acceleration
@@ -125,11 +128,11 @@ Benchmarking the impact of the **Pre-Warmed "Bake and Burn" Container Pool** aga
 
 While the broker core and execution engine are robust and fair, the current implementation has several recognized design constraints:
 
-1. **Thread-Per-Connection Ingress Model (The C10K Bottleneck):**
-   * *The Problem:* As documented in [`Idle_User_Simulation_Report.md`](Idle_User_Simulation_Report.md), each active TCP connection spawns a dedicated OS thread (`std::thread::spawn`). While physical RSS memory per idle thread is small (~16 KB), 2,000 idle `nc` clients reserve **+4.38 GB of Virtual Address Space (VSZ)** due to default 2 MB stack allocations.
-   * *The Impact:* The broker cannot scale to tens of thousands of concurrent idle or long-polling clients without exhausting OS thread handles (`EAGAIN`) or virtual memory limits.
-2. **Synchronous Socket I/O:**
-   * Connection threads block on `BufReader::read_line()`. A slow-loris client transmitting single bytes with long delays ties up an entire OS thread.
+1. **Thread-Per-Connection Ingress in Sync Server [Resolved in Async Server]:**
+   * *In Synchronous Mode ([`src/server.rs`](src/server.rs)):* Each active TCP connection spawns a dedicated OS thread (`std::thread::spawn`). While physical RSS memory per idle thread is small (~16 KB), holding thousands of idle connections reserves gigabytes of virtual memory and risks reaching OS thread ceilings (`EAGAIN` / `os error 11`).
+   * *In Asynchronous Mode ([`src/server_async.rs`](src/server_async.rs)):* Fully resolved via the Tokio event loop (`--async`), which multiplexes thousands of connections over `epoll`/`kqueue` using a fixed set of threads.
+2. **Synchronous Socket I/O (in Sync Model):**
+   * Connection threads in the sync server block on `BufReader::read_line()`. A slow-loris client transmitting single bytes with long delays ties up an entire OS thread in sync mode (mitigated when running with `--async`).
 3. **Single-Node In-Memory State:**
    * All scheduler queues, in-flight counters, and [`ResultStore`](src/store.rs) entries reside in the memory of a single process. If the broker restarts, pending jobs and uncollected results are lost.
 4. **Container Startup Latency (Mitigated by Pre-Warmed Pool):**
@@ -141,25 +144,25 @@ While the broker core and execution engine are robust and fair, the current impl
 
 ```mermaid
 flowchart LR
-    subgraph Milestone1["Phase 1: Event-Driven Ingress"]
-        M1["Tokio / Mio Async Runtime<br/>• Non-blocking epoll/kqueue<br/>• C10K scale on 8 OS threads<br/>• Green coroutine per socket"]
+    subgraph Milestone1["Phase 1: Event-Driven Ingress (Implemented)"]
+        M1["Tokio Async Runtime<br/>• Non-blocking epoll/kqueue<br/>• Fixed OS thread pool<br/>• Green task per socket (--async)"]
     end
 
-    subgraph Milestone2["Phase 2: Execution Acceleration"]
-        M2["Pre-Warmed Sandbox Pool<br/>• Warm container pool / Firecracker microVMs<br/>• Sub-10ms sandbox startup<br/>• Memory snapshot restoring"]
+    subgraph Milestone2["Phase 2: Execution Acceleration (Implemented)"]
+        M2["Pre-Warmed Sandbox Pool<br/>• Standby container pool<br/>• Sub-20ms container dispatch<br/>• Dynamic image fallback"]
     end
 
-    subgraph Milestone3["Phase 3: Distributed State"]
+    subgraph Milestone3["Phase 3: Distributed State & Clustering"]
         M3["Persistent Store & Clustering<br/>• Redis / Raft job queue backend<br/>• Multi-node worker clustering<br/>• Resilient crash recovery"]
     end
 
     Milestone1 --> Milestone2 --> Milestone3
 ```
 
-* **Phase 1: Async Event-Driven Network Ingress (`tokio` / `mio`):**
-  Transition from `std::net` thread-per-connection to an asynchronous event reactor. Idle connections will sleep directly in kernel `epoll`/`kqueue` tables, allowing millions of concurrent connections on a fixed pool of threads matching physical CPU cores.
-* **Phase 2: Pre-Warmed Container Pools & MicroVMs:**
-  Implement a container pooler that keeps paused, pre-warmed sandbox containers ready for immediate execution, dropping cold-start latency from ~500ms to <10ms. Evaluate Firecracker microVMs for hardware-level isolation with container-speed boots.
+* **Phase 1: Async Event-Driven Network Ingress (`tokio`):** *(Implemented in [`src/server_async.rs`](src/server_async.rs))*
+  Implemented a non-blocking event-driven reactor powered by Tokio. Connections are handled as green tasks yielding on I/O, allowing thousands of concurrent idle/polling clients on a fixed thread pool.
+* **Phase 2: Pre-Warmed Container Pools:** *(Implemented in [`src/sandbox.rs`](src/sandbox.rs))*
+  Maintains pre-warmed standby containers ready for immediate execution, dropping cold-start latency from ~500ms to sub-20ms.
 * **Phase 3: Distributed Job Queuing & Persistence:**
   Decouple the broker ingress nodes from worker nodes using a distributed queue (e.g., Redis Streams, NATS, or a Raft log) and persist result records in durable distributed storage for high availability.
 * **Phase 4: Explicit Cancellation Protocol:**
@@ -236,13 +239,15 @@ All settings can be specified via [`Config`](src/config.rs) or environment varia
 | Option | Env Variable | Default | Description |
 |---|---|---|---|
 | **Bind Address** | `DISTJOB_BIND_ADDR` | `127.0.0.1:7000` | TCP listener bind address |
-| **Workers** | `DISTJOB_WORKERS` | `4` | Number of execution worker threads |
-| **Per-Client Cap** | `DISTJOB_CLIENT_CAP` | `2` | Max concurrent in-flight jobs per client |
+| **Connection Model** | `DISTJOB_ASYNC` | `false` | Toggles Tokio async model (`true`/`1` via `--async`, or `--sync`) |
+| **Workers** | `DISTJOB_WORKERS` | `4` | Number of execution worker threads (`-w`) |
+| **Per-Client Cap** | `DISTJOB_CLIENT_CAP` | `2` | Max concurrent in-flight jobs per client (`-c`) |
 | **Enable Queue Limit** | `DISTJOB_ENABLE_QUEUE_LIMIT` | `true` | Toggles per-client pending queue rate limiting |
 | **Queue Multiplier** | `DISTJOB_QUEUE_LIMIT_MULTIPLIER` | `5` | Multiplier defining queue limit: $\text{cap} \times \text{mult}$ |
 | **Two-Queue Scheduler**| `DISTJOB_ENABLE_TWO_QUEUE_SCHEDULER` | `true` | Toggles $O(1)$ two-queue engine vs legacy single-queue loop |
 | **Pre-Warmed Pool** | `DISTJOB_ENABLE_PREWARMED_POOL` | `true` | Toggles standby pre-warmed container pool |
-| **Pool Size** | `DISTJOB_PREWARMED_POOL_SIZE` | `2` | Number of standby containers kept in warm pool |
+| **Pool Size** | `DISTJOB_PREWARMED_POOL_SIZE` | `2` | Number of standby containers kept in warm pool (`-p`) |
+| **Store Shards** | `DISTJOB_STORE_SHARDS` | `32` | Number of lock-striped shards in ResultStore (`-s`) |
 | **Python Image** | `DISTJOB_PYTHON_IMAGE` | `distjob-python:latest` | Docker image with pre-baked libraries |
 | **Sandbox Type** | `DISTJOB_SANDBOX` | `docker` | Sandbox engine: `docker`, `local`, or `mock` |
 | **Docker Runtime** | `DISTJOB_DOCKER_RUNTIME` | (none) | e.g. `runsc` for gVisor syscall isolation |
@@ -269,15 +274,24 @@ cargo test
 ```
 
 ### 8.3 Launch Broker
-```bash
-# Run with Docker sandbox (production mode with pre-warmed pool)
-cargo run -- --docker 127.0.0.1:7000
 
-# Run with Local sandbox (fast dev mode without Docker dependency)
-cargo run -- --local 127.0.0.1:7000
+The broker can run using either the **Asynchronous (Tokio)** or **Synchronous** connection model:
+
+```bash
+# Asynchronous Tokio connection model (recommended for high concurrency / production)
+cargo run --release -- --async 127.0.0.1:7000
+
+# Asynchronous model with 16 workers and 16 pre-warmed standby containers
+cargo run --release -- --async --workers 16 --pool-size 16 127.0.0.1:7000
+
+# Synchronous thread-per-connection model (default)
+cargo run --release -- --sync 127.0.0.1:7000
+
+# Run with Local process sandbox (fast dev mode without Docker dependency)
+cargo run --release -- --async --local 127.0.0.1:7000
 ```
 
-### 8.3 Quick Smoke Test via Netcat
+### 8.4 Quick Smoke Test via Netcat
 ```bash
 nc 127.0.0.1 7000
 SUBMIT alice python print("Hello from Sandboxed Broker!")
@@ -290,7 +304,7 @@ POLL <job_id>
 # Response: +Done {"job_id": ...}
 ```
 
-### 8.4 Run Stress Test Suite
+### 8.5 Run Stress Test Suite
 ```bash
 # Fast validation test (~3-5s, 4 clients, 29 requests)
 ./stress_test.sh --preset light
