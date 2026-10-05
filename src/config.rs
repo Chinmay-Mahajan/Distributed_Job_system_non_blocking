@@ -32,6 +32,7 @@ pub struct Config {
     pub prewarmed_pool_size: usize,
     pub docker_python_image: String,
     pub store_shards: usize,
+    pub enable_async_server: bool,
 }
 
 impl Default for Config {
@@ -57,6 +58,7 @@ impl Default for Config {
             prewarmed_pool_size: 4,
             docker_python_image: "distjob-python:latest".to_string(),
             store_shards: crate::store::DEFAULT_SHARDS,
+            enable_async_server: false,
         }
     }
 }
@@ -105,6 +107,9 @@ impl Config {
         }
         if let Ok(Ok(val)) = std::env::var("DISTJOB_STORE_SHARDS").map(|s| s.parse::<usize>()) {
             config.store_shards = val;
+        }
+        if let Ok(val) = std::env::var("DISTJOB_ASYNC") {
+            config.enable_async_server = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
         }
 
         config

@@ -7,6 +7,7 @@ use std::time::Duration;
 use distributed_jobv2::config::{Config, SandboxType};
 use distributed_jobv2::model::{JobResult, JobState, ServerResponse};
 use distributed_jobv2::server::BrokerServer;
+use distributed_jobv2::server_async::AsyncBrokerServer;
 
 fn start_test_server(sandbox_type: SandboxType, max_in_flight: usize) -> (String, Arc<BrokerServer>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -306,3 +307,86 @@ fn test_e2e_rate_limiting_rejection() {
 
     server.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_async_server_submit_and_poll() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::net::TcpStream as TokioTcpStream;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr").to_string();
+
+    let config = Config {
+        bind_address: addr.clone(),
+        worker_count: 2,
+        max_in_flight_per_client: 2,
+        sandbox_type: SandboxType::Local,
+        default_timeout_secs: 2,
+        result_ttl: Duration::from_secs(60),
+        enable_async_server: true,
+        ..Config::default()
+    };
+
+    let server = Arc::new(AsyncBrokerServer::new(config));
+    let server_clone = Arc::clone(&server);
+
+    tokio::spawn(async move {
+        let _ = server_clone.run_listener(listener).await;
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let stream = TokioTcpStream::connect(&addr).await.expect("connect to async broker");
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = TokioBufReader::new(reader);
+
+    // Submit python code via JSON
+    let submit_req = serde_json::json!({
+        "action": "SUBMIT",
+        "client_id": "test-async-alice",
+        "language": "python",
+        "code": "print('hello from async server')",
+        "timeout_secs": 5
+    });
+    writer.write_all(format!("{}\n", submit_req).as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).await.unwrap();
+
+    let submit_resp: ServerResponse = serde_json::from_str(response_line.trim()).expect("parse submit response");
+    let job_id = match submit_resp {
+        ServerResponse::SubmitOk { job_id, .. } => job_id,
+        other => panic!("Expected SubmitOk, got {:?}", other),
+    };
+
+    // Poll until DONE
+    let mut result_done = None;
+    for _ in 0..50 {
+        let poll_req = serde_json::json!({
+            "action": "POLL",
+            "job_id": job_id.clone()
+        });
+        writer.write_all(format!("{}\n", poll_req).as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let mut poll_line = String::new();
+        reader.read_line(&mut poll_line).await.unwrap();
+
+        if let Ok(res) = serde_json::from_str::<JobResult>(poll_line.trim())
+            && res.status == JobState::Done
+        {
+            result_done = Some(res);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let final_res = result_done.expect("Job should finish within timeout");
+    assert_eq!(final_res.status, JobState::Done);
+    assert_eq!(final_res.exit_code, Some(0));
+    assert!(final_res.stdout.contains("hello from async server"));
+
+    server.shutdown();
+}
+

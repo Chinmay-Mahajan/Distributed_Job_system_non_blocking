@@ -25,6 +25,8 @@ fn main() -> std::io::Result<()> {
             "--local" => config.sandbox_type = SandboxType::Local,
             "--mock" => config.sandbox_type = SandboxType::Mock,
             "--docker" => config.sandbox_type = SandboxType::Docker,
+            "--async" => config.enable_async_server = true,
+            "--sync" => config.enable_async_server = false,
             "--workers" | "-w" => {
                 if i + 1 < args.len() {
                     if let Ok(val) = args[i + 1].parse::<usize>() {
@@ -76,6 +78,8 @@ fn main() -> std::io::Result<()> {
                 println!("Usage: cargo run -- [OPTIONS]");
                 println!();
                 println!("Options:");
+                println!("  --async                  Run using Asynchronous Tokio connection model");
+                println!("  --sync                   Run using Synchronous thread-per-connection model (default)");
                 println!("  --local                  Run using Local Process sandbox");
                 println!("  --docker                 Run using Docker sandbox (default)");
                 println!("  --mock                   Run using Mock sandbox");
@@ -88,6 +92,7 @@ fn main() -> std::io::Result<()> {
                 println!("  --help, -h               Show this help message");
                 println!();
                 println!("Environment variables (can be set inline before 'cargo run'):");
+                println!("  DISTJOB_ASYNC            e.g. DISTJOB_ASYNC=1 (enables Tokio async model)");
                 println!("  DISTJOB_WORKERS          e.g. DISTJOB_WORKERS=16");
                 println!("  DISTJOB_CLIENT_CAP       e.g. DISTJOB_CLIENT_CAP=4");
                 println!("  DISTJOB_PREWARMED_POOL_SIZE e.g. DISTJOB_PREWARMED_POOL_SIZE=8");
@@ -120,6 +125,7 @@ fn main() -> std::io::Result<()> {
     println!("          SANDBOXED JOB EXECUTION BROKER (v2)               ");
     println!("============================================================");
     println!("  Bind Address:        {}", config.bind_address);
+    println!("  Connection Model:    {}", if config.enable_async_server { "Async (Tokio Event Loop)" } else { "Sync (Thread-per-Connection)" });
     println!("  Worker Threads:      {}", config.worker_count);
     println!("  Per-Client Cap:      {}", config.max_in_flight_per_client);
     println!("  Sandbox Type:        {:?}", config.sandbox_type);
@@ -129,17 +135,40 @@ fn main() -> std::io::Result<()> {
     println!("============================================================");
 
     let bind_addr = config.bind_address.clone();
-    let listener = TcpListener::bind(&bind_addr)?;
-    let server = std::sync::Arc::new(BrokerServer::new(config));
 
-    // Register Ctrl+C handler for graceful shutdown
-    let server_shutdown = std::sync::Arc::clone(&server);
-    ctrlc::set_handler(move || {
-        println!("\n[INFO] Received shutdown signal (Ctrl+C). Cleaning up standby containers...");
-        server_shutdown.shutdown();
-        println!("[INFO] Shutdown complete. All containers cleaned up.");
-        std::process::exit(0);
-    }).expect("Error setting Ctrl-C handler");
+    if config.enable_async_server {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
 
-    server.run_listener(listener)
+        rt.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+            let server = std::sync::Arc::new(distributed_jobv2::server_async::AsyncBrokerServer::new(config));
+
+            // Register Ctrl+C handler for graceful shutdown
+            let server_shutdown = std::sync::Arc::clone(&server);
+            ctrlc::set_handler(move || {
+                println!("\n[INFO] Received shutdown signal (Ctrl+C). Cleaning up standby containers...");
+                server_shutdown.shutdown();
+                println!("[INFO] Shutdown complete. All containers cleaned up.");
+                std::process::exit(0);
+            }).expect("Error setting Ctrl-C handler");
+
+            server.run_listener(listener).await
+        })
+    } else {
+        let listener = TcpListener::bind(&bind_addr)?;
+        let server = std::sync::Arc::new(BrokerServer::new(config));
+
+        // Register Ctrl+C handler for graceful shutdown
+        let server_shutdown = std::sync::Arc::clone(&server);
+        ctrlc::set_handler(move || {
+            println!("\n[INFO] Received shutdown signal (Ctrl+C). Cleaning up standby containers...");
+            server_shutdown.shutdown();
+            println!("[INFO] Shutdown complete. All containers cleaned up.");
+            std::process::exit(0);
+        }).expect("Error setting Ctrl-C handler");
+
+        server.run_listener(listener)
+    }
 }

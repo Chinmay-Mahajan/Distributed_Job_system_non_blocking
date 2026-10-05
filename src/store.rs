@@ -202,8 +202,14 @@ impl ResultStore {
         shutdown: Arc<AtomicBool>,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            let slice = Duration::from_millis(50);
             while !shutdown.load(Ordering::Relaxed) {
-                thread::sleep(interval);
+                let mut elapsed = Duration::ZERO;
+                while elapsed < interval && !shutdown.load(Ordering::Relaxed) {
+                    let to_sleep = slice.min(interval.saturating_sub(elapsed));
+                    thread::sleep(to_sleep);
+                    elapsed += to_sleep;
+                }
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
