@@ -125,10 +125,12 @@ impl JobResult {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action")]
 pub enum ClientCommand {
+    #[serde(rename = "REGISTER", alias = "AUTH")]
+    Register,
     #[serde(rename = "SUBMIT")]
     Submit {
         #[serde(default)]
-        client_id: Option<String>,
+        secret_key: String,
         language: String,
         code: String,
         #[serde(default)]
@@ -137,9 +139,17 @@ pub enum ClientCommand {
         timeout_secs: Option<u64>,
     },
     #[serde(rename = "POLL")]
-    Poll { job_id: String },
+    Poll {
+        #[serde(default)]
+        secret_key: String,
+        job_id: String,
+    },
     #[serde(rename = "STATUS")]
-    Status { job_id: String },
+    Status {
+        #[serde(default)]
+        secret_key: String,
+        job_id: String,
+    },
     #[serde(rename = "PING")]
     Ping,
     #[serde(rename = "STATS")]
@@ -150,6 +160,10 @@ pub enum ClientCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ServerResponse {
+    RegisterOk {
+        status: String,
+        secret_key: String,
+    },
     SubmitOk {
         status: String,
         job_id: String,

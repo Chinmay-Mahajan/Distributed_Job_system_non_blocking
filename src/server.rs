@@ -5,11 +5,12 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use uuid::Uuid;
 
+use crate::auth::AuthManager;
 use crate::config::{Config, SandboxType};
 use crate::model::{ClientCommand, Job};
 use crate::protocol::{
-    format_error, format_poll_ok, format_pong, format_stats, format_status_ok, format_submit_ok,
-    parse_line, ProtocolFormat,
+    format_error, format_poll_ok, format_pong, format_register_ok, format_stats,
+    format_status_ok, format_submit_ok, parse_line, ProtocolFormat,
 };
 use crate::sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox};
 use crate::scheduler::TwoLevelScheduler;
@@ -20,6 +21,7 @@ pub struct BrokerServer {
     pub config: Config,
     pub scheduler: Arc<TwoLevelScheduler>,
     pub result_store: Arc<ResultStore>,
+    pub auth_manager: Arc<AuthManager>,
     worker_pool: std::sync::Mutex<Option<WorkerPool>>,
     reaper_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub shutdown: Arc<AtomicBool>,
@@ -36,6 +38,7 @@ impl BrokerServer {
 
         let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
         let result_store = Arc::new(ResultStore::with_shards(config.result_ttl, config.store_shards));
+        let auth_manager = Arc::new(AuthManager::new(&config));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Start background result reaper
@@ -58,6 +61,7 @@ impl BrokerServer {
             config,
             scheduler,
             result_store,
+            auth_manager,
             worker_pool: std::sync::Mutex::new(Some(worker_pool)),
             reaper_handle: std::sync::Mutex::new(Some(reaper_handle)),
             shutdown,
@@ -92,6 +96,7 @@ impl BrokerServer {
                 Ok(stream) => {
                     let scheduler = Arc::clone(&self.scheduler);
                     let result_store = Arc::clone(&self.result_store);
+                    let auth_manager = Arc::clone(&self.auth_manager);
                     let config = self.config.clone();
 
                     let builder = std::thread::Builder::new()
@@ -99,7 +104,9 @@ impl BrokerServer {
                         .stack_size(256 * 1024);
 
                     if let Err(e) = builder.spawn(move || {
-                        if let Err(e) = handle_connection(stream, scheduler, result_store, config) {
+                        if let Err(e) =
+                            handle_connection(stream, scheduler, result_store, auth_manager, config)
+                        {
                             eprintln!("Connection error: {}", e);
                         }
                     }) {
@@ -139,6 +146,7 @@ fn handle_connection(
     stream: TcpStream,
     scheduler: Arc<TwoLevelScheduler>,
     result_store: Arc<ResultStore>,
+    auth_manager: Arc<AuthManager>,
     config: Config,
 ) -> std::io::Result<()> {
     let peer_addr = stream.peer_addr()?;
@@ -172,20 +180,35 @@ fn handle_connection(
         };
 
         match parsed.command {
+            ClientCommand::Register => {
+                let secret_key = auth_manager.register();
+                let resp = format_register_ok(&secret_key, parsed.format);
+                writer.write_all(resp.as_bytes())?;
+            }
+
             ClientCommand::Submit {
-                client_id,
+                secret_key,
                 language,
                 code,
                 stdin,
                 timeout_secs,
             } => {
-                let client = client_id.unwrap_or_else(|| default_client_id.clone());
+                let key_hash = match auth_manager.verify_submit(&secret_key) {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes())?;
+                        writer.flush()?;
+                        continue;
+                    }
+                };
+
                 let timeout = timeout_secs
                     .unwrap_or(config.default_timeout_secs)
                     .min(config.max_timeout_secs);
 
                 let job_id = Uuid::new_v4().to_string();
-                let job = Job::new(job_id.clone(), client, language, code, stdin, timeout);
+                let job = Job::new(job_id.clone(), key_hash, language, code, stdin, timeout);
 
                 match scheduler.submit(job.clone()) {
                     Ok(()) => {
@@ -203,17 +226,55 @@ fn handle_connection(
                 }
             }
 
-            ClientCommand::Poll { job_id } => {
+            ClientCommand::Poll { secret_key, job_id } => {
+                let key_hash = match auth_manager.verify_poll(&secret_key) {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes())?;
+                        writer.flush()?;
+                        continue;
+                    }
+                };
+
                 let resp = match result_store.get(&job_id) {
-                    Some(result) => format_poll_ok(&result, parsed.format),
+                    Some(result) => {
+                        if result.client_id != key_hash {
+                            format_error(
+                                "Unauthorized: job belongs to another client",
+                                parsed.format,
+                            )
+                        } else {
+                            format_poll_ok(&result, parsed.format)
+                        }
+                    }
                     None => format_error("Job not found or expired", parsed.format),
                 };
                 writer.write_all(resp.as_bytes())?;
             }
 
-            ClientCommand::Status { job_id } => {
+            ClientCommand::Status { secret_key, job_id } => {
+                let key_hash = match auth_manager.verify_poll(&secret_key) {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes())?;
+                        writer.flush()?;
+                        continue;
+                    }
+                };
+
                 let resp = match result_store.get(&job_id) {
-                    Some(result) => format_status_ok(&job_id, result.status, parsed.format),
+                    Some(result) => {
+                        if result.client_id != key_hash {
+                            format_error(
+                                "Unauthorized: job belongs to another client",
+                                parsed.format,
+                            )
+                        } else {
+                            format_status_ok(&job_id, result.status, parsed.format)
+                        }
+                    }
                     None => format_error("Job not found or expired", parsed.format),
                 };
                 writer.write_all(resp.as_bytes())?;

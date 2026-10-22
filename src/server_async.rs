@@ -5,11 +5,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
+use crate::auth::AuthManager;
 use crate::config::{Config, SandboxType};
 use crate::model::{ClientCommand, Job};
 use crate::protocol::{
-    format_error, format_poll_ok, format_pong, format_stats, format_status_ok, format_submit_ok,
-    parse_line, ProtocolFormat,
+    format_error, format_poll_ok, format_pong, format_register_ok, format_stats,
+    format_status_ok, format_submit_ok, parse_line, ProtocolFormat,
 };
 use crate::sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox};
 use crate::scheduler::TwoLevelScheduler;
@@ -26,6 +27,7 @@ pub struct AsyncBrokerServer {
     pub config: Config,
     pub scheduler: Arc<TwoLevelScheduler>,
     pub result_store: Arc<ResultStore>,
+    pub auth_manager: Arc<AuthManager>,
     worker_pool: std::sync::Mutex<Option<WorkerPool>>,
     reaper_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
     pub shutdown: Arc<AtomicBool>,
@@ -42,6 +44,7 @@ impl AsyncBrokerServer {
 
         let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
         let result_store = Arc::new(ResultStore::with_shards(config.result_ttl, config.store_shards));
+        let auth_manager = Arc::new(AuthManager::new(&config));
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Start background result reaper
@@ -64,6 +67,7 @@ impl AsyncBrokerServer {
             config,
             scheduler,
             result_store,
+            auth_manager,
             worker_pool: std::sync::Mutex::new(Some(worker_pool)),
             reaper_handle: std::sync::Mutex::new(Some(reaper_handle)),
             shutdown,
@@ -106,11 +110,15 @@ impl AsyncBrokerServer {
 
             let scheduler = Arc::clone(&self.scheduler);
             let result_store = Arc::clone(&self.result_store);
+            let auth_manager = Arc::clone(&self.auth_manager);
             let config = self.config.clone();
 
             // Spawn lightweight Tokio task instead of a 256KB OS thread!
             tokio::spawn(async move {
-                if let Err(e) = handle_connection_async(stream, scheduler, result_store, config).await {
+                if let Err(e) =
+                    handle_connection_async(stream, scheduler, result_store, auth_manager, config)
+                        .await
+                {
                     if e.kind() != std::io::ErrorKind::UnexpectedEof
                         && e.kind() != std::io::ErrorKind::ConnectionReset
                     {
@@ -147,6 +155,7 @@ async fn handle_connection_async(
     stream: TcpStream,
     scheduler: Arc<TwoLevelScheduler>,
     result_store: Arc<ResultStore>,
+    auth_manager: Arc<AuthManager>,
     config: Config,
 ) -> std::io::Result<()> {
     let peer_addr = stream.peer_addr()?;
@@ -180,22 +189,37 @@ async fn handle_connection_async(
         };
 
         match parsed.command {
+            ClientCommand::Register => {
+                let secret_key = auth_manager.register_async().await;
+                let resp = format_register_ok(&secret_key, parsed.format);
+                writer.write_all(resp.as_bytes()).await?;
+            }
+
             ClientCommand::Submit {
-                client_id,
+                secret_key,
                 language,
                 code,
                 stdin,
                 timeout_secs,
             } => {
+                let key_hash = match auth_manager.verify_submit_async(&secret_key).await {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes()).await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                };
+
                 let job_id = Uuid::new_v4().to_string();
-                let client = client_id.unwrap_or_else(|| default_client_id.clone());
                 let effective_timeout = timeout_secs
                     .unwrap_or(config.default_timeout_secs)
                     .min(config.max_timeout_secs);
 
                 let job = Job::new(
                     job_id.clone(),
-                    client,
+                    key_hash,
                     language,
                     code,
                     stdin,
@@ -215,17 +239,55 @@ async fn handle_connection_async(
                 }
             }
 
-            ClientCommand::Poll { job_id } => {
+            ClientCommand::Poll { secret_key, job_id } => {
+                let key_hash = match auth_manager.verify_poll_async(&secret_key).await {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes()).await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                };
+
                 let resp = match result_store.get(&job_id) {
-                    Some(result) => format_poll_ok(&result, parsed.format),
+                    Some(result) => {
+                        if result.client_id != key_hash {
+                            format_error(
+                                "Unauthorized: job belongs to another client",
+                                parsed.format,
+                            )
+                        } else {
+                            format_poll_ok(&result, parsed.format)
+                        }
+                    }
                     None => format_error("Job not found or expired", parsed.format),
                 };
                 writer.write_all(resp.as_bytes()).await?;
             }
 
-            ClientCommand::Status { job_id } => {
+            ClientCommand::Status { secret_key, job_id } => {
+                let key_hash = match auth_manager.verify_poll_async(&secret_key).await {
+                    Ok(h) => h,
+                    Err(err_msg) => {
+                        let resp = format_error(&err_msg, parsed.format);
+                        writer.write_all(resp.as_bytes()).await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                };
+
                 let resp = match result_store.get(&job_id) {
-                    Some(result) => format_status_ok(&job_id, result.status, parsed.format),
+                    Some(result) => {
+                        if result.client_id != key_hash {
+                            format_error(
+                                "Unauthorized: job belongs to another client",
+                                parsed.format,
+                            )
+                        } else {
+                            format_status_ok(&job_id, result.status, parsed.format)
+                        }
+                    }
                     None => format_error("Job not found or expired", parsed.format),
                 };
                 writer.write_all(resp.as_bytes()).await?;

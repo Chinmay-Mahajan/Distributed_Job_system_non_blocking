@@ -1,3 +1,4 @@
+pub mod auth;
 pub mod config;
 pub mod model;
 pub mod protocol;
@@ -8,6 +9,7 @@ pub mod server_async;
 pub mod store;
 pub mod worker;
 
+pub use auth::{AuthManager, SharedAuthManager};
 pub use config::{Config, SandboxType};
 pub use model::{ClientCommand, Job, JobRequest, JobResult, JobState, ServerResponse};
 pub use sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox, SandboxExecutionResult};

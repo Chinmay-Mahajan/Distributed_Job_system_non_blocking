@@ -33,6 +33,13 @@ pub struct Config {
     pub docker_python_image: String,
     pub store_shards: usize,
     pub enable_async_server: bool,
+    pub redis_url: String,
+    pub l1_max_capacity: usize,
+    pub l1_ttl: Duration,
+    pub l2_redis_ttl_secs: u64,
+    pub max_polls_per_sec: u32,
+    pub max_poll_strikes: u32,
+    pub l2_penalty_ttl_secs: u64,
 }
 
 impl Default for Config {
@@ -59,6 +66,13 @@ impl Default for Config {
             docker_python_image: "distjob-python:latest".to_string(),
             store_shards: crate::store::DEFAULT_SHARDS,
             enable_async_server: false,
+            redis_url: "redis://127.0.0.1:6379/1".to_string(),
+            l1_max_capacity: 10_000,
+            l1_ttl: Duration::from_secs(120),
+            l2_redis_ttl_secs: 3600,
+            max_polls_per_sec: 25,
+            max_poll_strikes: 3,
+            l2_penalty_ttl_secs: 60,
         }
     }
 }
@@ -110,6 +124,27 @@ impl Config {
         }
         if let Ok(val) = std::env::var("DISTJOB_ASYNC") {
             config.enable_async_server = matches!(val.to_lowercase().as_str(), "true" | "1" | "yes");
+        }
+        if let Ok(url) = std::env::var("DISTJOB_REDIS_URL") {
+            config.redis_url = url;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_L1_CAP").map(|v| v.parse::<usize>()) {
+            config.l1_max_capacity = val;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_L1_TTL_SECS").map(|v| v.parse::<u64>()) {
+            config.l1_ttl = Duration::from_secs(val);
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_L2_TTL_SECS").map(|v| v.parse::<u64>()) {
+            config.l2_redis_ttl_secs = val;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_MAX_POLLS_PER_SEC").map(|v| v.parse::<u32>()) {
+            config.max_polls_per_sec = val;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_MAX_POLL_STRIKES").map(|v| v.parse::<u32>()) {
+            config.max_poll_strikes = val;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_L2_PENALTY_SECS").map(|v| v.parse::<u64>()) {
+            config.l2_penalty_ttl_secs = val;
         }
 
         config

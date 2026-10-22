@@ -12,22 +12,15 @@ pub struct ParsedRequest {
     pub format: ProtocolFormat,
 }
 
-pub fn parse_line(line: &str, default_client_id: &str) -> Result<ParsedRequest, String> {
+pub fn parse_line(line: &str, _default_client_id: &str) -> Result<ParsedRequest, String> {
     let trimmed = line.trim();
     if trimmed.is_empty() {
         return Err("Empty command".to_string());
     }
 
     if trimmed.starts_with('{') {
-        let mut cmd: ClientCommand =
+        let cmd: ClientCommand =
             serde_json::from_str(trimmed).map_err(|e| format!("Invalid JSON request: {}", e))?;
-
-        // If client_id is omitted in Submit, fill in default_client_id
-        if let ClientCommand::Submit { ref mut client_id, .. } = cmd
-            && client_id.as_ref().map(|s| s.is_empty()).unwrap_or(true)
-        {
-            *client_id = Some(default_client_id.to_string());
-        }
 
         return Ok(ParsedRequest {
             command: cmd,
@@ -40,23 +33,22 @@ pub fn parse_line(line: &str, default_client_id: &str) -> Result<ParsedRequest, 
     let verb = parts[0].to_uppercase();
 
     match verb.as_str() {
+        "REGISTER" | "AUTH" => Ok(ParsedRequest {
+            command: ClientCommand::Register,
+            format: ProtocolFormat::Text,
+        }),
         "SUBMIT" => {
-            // Syntax: SUBMIT <client_id> <language> <code...>
-            // Or fallback: SUBMIT <language> <code...> (client_id defaulted)
-            if parts.len() < 3 {
-                return Err("Syntax: SUBMIT <client_id> <language> <code>".to_string());
+            // Syntax: SUBMIT <secret_key> <language> <code...>
+            if parts.len() < 4 {
+                return Err("Syntax: SUBMIT <secret_key> <language> <code>".to_string());
             }
 
-            let (client_id, language, code_start_idx) = if parts.len() >= 4 {
-                (parts[1].to_string(), parts[2].to_string(), 3)
-            } else {
-                (default_client_id.to_string(), parts[1].to_string(), 2)
-            };
-
-            let code = parts[code_start_idx..].join(" ");
+            let secret_key = parts[1].to_string();
+            let language = parts[2].to_string();
+            let code = parts[3..].join(" ");
             Ok(ParsedRequest {
                 command: ClientCommand::Submit {
-                    client_id: Some(client_id),
+                    secret_key,
                     language,
                     code,
                     stdin: None,
@@ -66,23 +58,27 @@ pub fn parse_line(line: &str, default_client_id: &str) -> Result<ParsedRequest, 
             })
         }
         "POLL" => {
-            if parts.len() < 2 {
-                return Err("Syntax: POLL <job_id>".to_string());
+            // Syntax: POLL <secret_key> <job_id>
+            if parts.len() < 3 {
+                return Err("Syntax: POLL <secret_key> <job_id>".to_string());
             }
             Ok(ParsedRequest {
                 command: ClientCommand::Poll {
-                    job_id: parts[1].to_string(),
+                    secret_key: parts[1].to_string(),
+                    job_id: parts[2].to_string(),
                 },
                 format: ProtocolFormat::Text,
             })
         }
         "STATUS" => {
-            if parts.len() < 2 {
-                return Err("Syntax: STATUS <job_id>".to_string());
+            // Syntax: STATUS <secret_key> <job_id>
+            if parts.len() < 3 {
+                return Err("Syntax: STATUS <secret_key> <job_id>".to_string());
             }
             Ok(ParsedRequest {
                 command: ClientCommand::Status {
-                    job_id: parts[1].to_string(),
+                    secret_key: parts[1].to_string(),
+                    job_id: parts[2].to_string(),
                 },
                 format: ProtocolFormat::Text,
             })
@@ -96,6 +92,19 @@ pub fn parse_line(line: &str, default_client_id: &str) -> Result<ParsedRequest, 
             format: ProtocolFormat::Text,
         }),
         _ => Err(format!("Unknown command: '{}'", verb)),
+    }
+}
+
+pub fn format_register_ok(secret_key: &str, format: ProtocolFormat) -> String {
+    match format {
+        ProtocolFormat::Json => {
+            let resp = ServerResponse::RegisterOk {
+                status: "ok".to_string(),
+                secret_key: secret_key.to_string(),
+            };
+            format!("{}\n", serde_json::to_string(&resp).unwrap())
+        }
+        ProtocolFormat::Text => format!("+{}\r\n", secret_key),
     }
 }
 
