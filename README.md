@@ -80,6 +80,8 @@ flowchart TD
   * Exceeding the polling limit rejects the excess poll and increments `violation_strikes`.
   * When a client reaches `max_poll_strikes` (default `3`), the broker **evicts the client from the L1 heap cache** and writes `penalty:<key_hash> = 1` (`EX 60s`) into L2 Redis. While on probation, L2 hits are **not** re-promoted to L1, protecting L1 heap capacity for well-behaved tenants.
 * **Strict Cross-Tenant Job Ownership (AuthZ):** Every `POLL` and `STATUS` query verifies `result.client_id == key_hash`, preventing any tenant from inspecting or polling another user's job outputs.
+* **Per-Connection `REGISTER` Guard (`peer_auth_map`):** Each accepted TCP connection (`default_client_id = client-<ip>:<port>`) is tracked in `peer_auth_map: RwLock<HashMap<String, bool>>` (initialized to `false` on connect, flipped to `true` on the first `REGISTER`). Calling `REGISTER` / `AUTH` more than once on the same connection is immediately rejected (`Already registered`), preventing a client from minting multiple `secret_key` tokens on one socket to bypass per-client in-flight or polling quotas while still allowing separate connections from the same host IP (distinct ephemeral ports) to register independently.
+* **Proactive Idle & Key-Expiry Connection Eviction:** Both the synchronous (`TcpStream::set_read_timeout`) and asynchronous (`tokio::time::timeout`) socket loops enforce a dual deadline of `min(client_idle_timeout, remaining_key_ttl)`. If a client sits idle past `client_idle_timeout` (default `300s`) or its issued `secret_key` reaches `l2_redis_ttl_secs` (`3600s`), the server proactively sends an `ERR` disconnect notice, closes the TCP socket, and guarantees cleanup of `peer_auth_map` via an RAII drop guard (`ConnectionCleanupGuard` / `AsyncConnectionCleanupGuard`).
 
 ### 2.2 Two-Queue $O(1)$ Fair Scheduler
 * **Instantaneous $O(1)$ Dispatch:** Workers never scan through an $O(N)$ list of clients skipping saturated tenants under a shared mutex. Workers pop eligible tenants directly from [`dispatchable_queue`](src/scheduler.rs).
@@ -295,6 +297,7 @@ All settings can be specified via [`Config`](src/config.rs) or environment varia
 | **Max Polls / Sec** | `DISTJOB_MAX_POLLS_PER_SEC` | `25` | Maximum allowed `POLL` / `STATUS` requests per second per user |
 | **Max Poll Strikes** | `DISTJOB_MAX_POLL_STRIKES` | `3` | Poll quota violations before eviction from L1 to L2 probation |
 | **L2 Penalty TTL** | `DISTJOB_L2_PENALTY_SECS` | `60` | Duration (seconds) a demoted spammer is blocked from L1 promotion |
+| **Client Idle Timeout** | `DISTJOB_IDLE_TIMEOUT_SECS` | `300` | Max socket inactivity (seconds) before kicking an idle connection |
 
 ---
 
