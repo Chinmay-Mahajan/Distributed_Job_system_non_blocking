@@ -60,6 +60,9 @@ pub struct AuthManager {
     redis_client: Option<redis::Client>,
     async_redis_conn: tokio::sync::RwLock<Option<redis::aio::MultiplexedConnection>>,
     fallback_l2: RwLock<HashMap<String, FallbackL2Entry>>,
+    /// Maps each connection's `default_client_id` (`client-<peer_addr>`) -> `bool` (initial `false`).
+    /// Prevents a single connection from calling `REGISTER`/`AUTH` multiple times to mint multiple keys.
+    peer_auth_map: RwLock<HashMap<String, bool>>,
 }
 
 impl AuthManager {
@@ -84,7 +87,27 @@ impl AuthManager {
             redis_client,
             async_redis_conn: tokio::sync::RwLock::new(None),
             fallback_l2: RwLock::new(HashMap::new()),
+            peer_auth_map: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Initializes the per-connection registration state (`default_client_id -> false`)
+    /// when a new TCP connection is accepted.
+    pub fn init_connection(&self, default_client_id: &str) {
+        let mut map = self.peer_auth_map.write().unwrap();
+        map.entry(default_client_id.to_string()).or_insert(false);
+    }
+
+    /// Cleans up the per-connection registration entry when the TCP socket closes.
+    pub fn remove_connection(&self, default_client_id: &str) {
+        let mut map = self.peer_auth_map.write().unwrap();
+        map.remove(default_client_id);
+    }
+
+    /// Checks if `default_client_id` is currently tracked in `peer_auth_map`.
+    pub fn has_connection(&self, default_client_id: &str) -> bool {
+        let map = self.peer_auth_map.read().unwrap();
+        map.contains_key(default_client_id)
     }
 
     /// Deterministically hashes a raw `secret_key` using SHA-256 into a 64-character hex string.
@@ -175,6 +198,23 @@ impl AuthManager {
         self.l2_store_sync(&key_hash);
 
         secret_key
+    }
+
+    /// Checks whether `default_client_id` (`client-<peer_addr>`) has already registered (`bool == false`).
+    /// If `false`, flips it to `true` and issues a single `secret_key`. If `true`, rejects duplicate registration.
+    pub fn register_for_client(&self, default_client_id: &str) -> Result<String, String> {
+        {
+            let mut map = self.peer_auth_map.write().unwrap();
+            let already_authed = map.entry(default_client_id.to_string()).or_insert(false);
+            if *already_authed {
+                return Err(format!(
+                    "Already registered: connection '{}' has already been issued a secret_key",
+                    default_client_id
+                ));
+            }
+            *already_authed = true;
+        }
+        Ok(self.register())
     }
 
     /// Verifies `secret_key` for `SUBMIT` requests (L1 -> L2 read-through) and returns
@@ -402,6 +442,23 @@ impl AuthManager {
         self.l2_store_async(&key_hash).await;
 
         secret_key
+    }
+
+    /// Asynchronously checks whether `default_client_id` (`client-<peer_addr>`) has already registered (`bool == false`).
+    /// If `false`, flips it to `true` and issues a single `secret_key`. If `true`, rejects duplicate registration.
+    pub async fn register_for_client_async(&self, default_client_id: &str) -> Result<String, String> {
+        {
+            let mut map = self.peer_auth_map.write().unwrap();
+            let already_authed = map.entry(default_client_id.to_string()).or_insert(false);
+            if *already_authed {
+                return Err(format!(
+                    "Already registered: connection '{}' has already been issued a secret_key",
+                    default_client_id
+                ));
+            }
+            *already_authed = true;
+        }
+        Ok(self.register_async().await)
     }
 
     /// Asynchronously verifies `secret_key` for `SUBMIT` requests (L1 -> L2 read-through).

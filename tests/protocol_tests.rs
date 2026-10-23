@@ -11,6 +11,11 @@ fn test_parse_json_register_and_submit() {
     assert_eq!(reg_req.format, ProtocolFormat::Json);
     assert_eq!(reg_req.command, ClientCommand::Register);
 
+    let auth_raw = r#"{"action": "AUTH"}"#;
+    let auth_req = parse_line(auth_raw, "default-client").expect("parse auth alias ok");
+    assert_eq!(auth_req.format, ProtocolFormat::Json);
+    assert_eq!(auth_req.command, ClientCommand::Register);
+
     let raw = r#"{"action": "SUBMIT", "secret_key": "sk_alice_123", "language": "python", "code": "print(123)", "stdin": "input", "timeout_secs": 5}"#;
     let req = parse_line(raw, "default-client").expect("parse ok");
 
@@ -31,14 +36,27 @@ fn test_parse_json_register_and_submit() {
         }
         _ => panic!("Expected submit command"),
     }
+
+    let poll_json = r#"{"action": "POLL", "secret_key": "sk_alice_123", "job_id": "job-42"}"#;
+    let poll_req = parse_line(poll_json, "default-client").expect("parse poll json ok");
+    assert_eq!(
+        poll_req.command,
+        ClientCommand::Poll {
+            secret_key: "sk_alice_123".into(),
+            job_id: "job-42".into(),
+        }
+    );
 }
 
 #[test]
-fn test_parse_text_commands() {
-    // REGISTER
+fn test_parse_text_commands_and_mandatory_secret_key() {
+    // REGISTER / AUTH
     let reg = parse_line("REGISTER", "default").expect("ok");
     assert_eq!(reg.format, ProtocolFormat::Text);
     assert_eq!(reg.command, ClientCommand::Register);
+
+    let auth = parse_line("AUTH", "default").expect("ok");
+    assert_eq!(auth.command, ClientCommand::Register);
 
     // SUBMIT <secret_key> <language> <code...>
     let req = parse_line("SUBMIT sk_bob_999 python print('hello world')", "default").expect("ok");
@@ -79,6 +97,11 @@ fn test_parse_text_commands() {
         _ => panic!("Expected status"),
     }
 
+    // Omitting secret_key in text commands must return a syntax error
+    assert!(parse_line("SUBMIT python print(1)", "default").is_err());
+    assert!(parse_line("POLL 12345", "default").is_err());
+    assert!(parse_line("STATUS 12345", "default").is_err());
+
     // PING
     let ping_req = parse_line("PING", "default").expect("ok");
     assert_eq!(ping_req.format, ProtocolFormat::Text);
@@ -107,14 +130,14 @@ fn test_formatters() {
 
     let res = JobResult {
         job_id: "abc-123".into(),
-        client_id: "alice".into(),
+        client_id: "e44e628a3c22186e4e6f7ccab624df3bc121099e96e1492fc3e0d21ebd898392".into(),
         status: JobState::Done,
         stdout: "out\n".into(),
         stderr: "".into(),
         exit_code: Some(0),
         error_message: None,
         job: JobRequest {
-            client_id: "alice".into(),
+            client_id: "e44e628a3c22186e4e6f7ccab624df3bc121099e96e1492fc3e0d21ebd898392".into(),
             language: "python".into(),
             code: "pass".into(),
             stdin: None,

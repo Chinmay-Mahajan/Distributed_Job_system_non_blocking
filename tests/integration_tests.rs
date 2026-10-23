@@ -372,17 +372,40 @@ async fn test_e2e_async_server_submit_and_poll() {
     let (reader, mut writer) = stream.into_split();
     let mut reader = TokioBufReader::new(reader);
 
-    // 0. Register via JSON
+    // 0. Register Alice via JSON on the Async Tokio server
     let reg_req = serde_json::json!({ "action": "REGISTER" });
     writer.write_all(format!("{}\n", reg_req).as_bytes()).await.unwrap();
     writer.flush().await.unwrap();
 
     let mut reg_line = String::new();
     reader.read_line(&mut reg_line).await.unwrap();
-    let reg_resp: ServerResponse = serde_json::from_str(reg_line.trim()).expect("parse register response");
-    let secret_key = match reg_resp {
+    let secret_key = match serde_json::from_str::<ServerResponse>(reg_line.trim()).unwrap() {
         ServerResponse::RegisterOk { secret_key, .. } => secret_key,
         other => panic!("Expected RegisterOk, got {:?}", other),
+    };
+
+    // Calling REGISTER a second time on the same connection must be rejected
+    writer.write_all(format!("{}\n", reg_req).as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    reg_line.clear();
+    reader.read_line(&mut reg_line).await.unwrap();
+    assert!(
+        reg_line.contains("Already registered"),
+        "Second REGISTER on same connection must be rejected, got: {}",
+        reg_line
+    );
+
+    // Bob connects on a separate socket (distinct peer_addr) and registers
+    let stream_bob = TokioTcpStream::connect(&addr).await.expect("connect bob");
+    let (bob_reader, mut bob_writer) = stream_bob.into_split();
+    let mut bob_reader = TokioBufReader::new(bob_reader);
+    bob_writer.write_all(format!("{}\n", reg_req).as_bytes()).await.unwrap();
+    bob_writer.flush().await.unwrap();
+    reg_line.clear();
+    bob_reader.read_line(&mut reg_line).await.unwrap();
+    let other_secret_key = match serde_json::from_str::<ServerResponse>(reg_line.trim()).unwrap() {
+        ServerResponse::RegisterOk { secret_key, .. } => secret_key,
+        other => panic!("Expected RegisterOk for Bob, got {:?}", other),
     };
 
     // 1. Submit python code via JSON
@@ -405,7 +428,23 @@ async fn test_e2e_async_server_submit_and_poll() {
         other => panic!("Expected SubmitOk, got {:?}", other),
     };
 
-    // 2. Poll until DONE
+    // 2. Verify cross-tenant poll rejection on the Async Tokio server
+    let cross_poll = serde_json::json!({
+        "action": "POLL",
+        "secret_key": other_secret_key,
+        "job_id": job_id
+    });
+    writer.write_all(format!("{}\n", cross_poll).as_bytes()).await.unwrap();
+    writer.flush().await.unwrap();
+    let mut cross_line = String::new();
+    reader.read_line(&mut cross_line).await.unwrap();
+    assert!(
+        cross_line.contains("Unauthorized: job belongs to another client"),
+        "Async server must reject cross-tenant poll, got: {}",
+        cross_line
+    );
+
+    // 3. Poll with owner's secret_key until DONE
     let mut result_done = None;
     for _ in 0..50 {
         let poll_req = serde_json::json!({
@@ -443,6 +482,17 @@ fn test_e2e_auth_ownership_and_unauthorized_rejection() {
     let mut stream = TcpStream::connect(&addr).expect("connect");
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
 
+    // 0. Submitting with an empty secret_key must be rejected
+    let missing_submit = serde_json::json!({
+        "action": "SUBMIT",
+        "language": "python",
+        "code": "print('missing key')"
+    });
+    writeln!(stream, "{}", missing_submit).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("Missing secret_key"), "Expected Missing secret_key error, got: {}", line);
+
     // 1. Submitting with an invalid/unregistered secret_key must be rejected
     let bad_submit = serde_json::json!({
         "action": "SUBMIT",
@@ -451,13 +501,25 @@ fn test_e2e_auth_ownership_and_unauthorized_rejection() {
         "code": "print('hack')"
     });
     writeln!(stream, "{}", bad_submit).unwrap();
-    let mut line = String::new();
+    line.clear();
     reader.read_line(&mut line).unwrap();
     assert!(line.contains("Unauthorized"), "Expected Unauthorized error, got: {}", line);
 
-    // 2. Register Alice and Bob
+    // 2. Register Alice on stream 1, verify duplicate REGISTER on stream 1 is rejected
     let sk_alice = register_client_json(&mut stream, &mut reader);
-    let sk_bob = register_client_json(&mut stream, &mut reader);
+    writeln!(stream, "{}", serde_json::json!({ "action": "REGISTER" })).unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(
+        line.contains("Already registered"),
+        "Duplicate REGISTER on same connection must be rejected, got: {}",
+        line
+    );
+
+    // Register Bob on a separate connection (stream 2 -> distinct peer_addr)
+    let mut stream_bob = TcpStream::connect(&addr).expect("connect bob");
+    let mut reader_bob = BufReader::new(stream_bob.try_clone().expect("clone bob"));
+    let sk_bob = register_client_json(&mut stream_bob, &mut reader_bob);
 
     // 3. Alice submits a job
     let alice_submit = serde_json::json!({
@@ -521,7 +583,7 @@ fn test_e2e_l1_l2_redis_cache_and_poll_rate_limit_demotion() {
 
     let auth = AuthManager::new(&config);
 
-    // 1. Register user -> inserted into both L1 (Heap) and L2 (Redis)
+    // 1. Register user -> inserted into both L1 (Heap) and L2 (Redis DB 1)
     let sk = auth.register();
     let key_hash = AuthManager::hash_key(&sk);
     assert!(auth.is_in_l1(&key_hash), "Newly registered key must be in L1");
@@ -567,4 +629,65 @@ fn test_e2e_l1_l2_redis_cache_and_poll_rate_limit_demotion() {
         !auth.is_in_l1(&key_hash),
         "Penalized user must NOT be re-promoted to L1 while penalty TTL is active in L2 Redis"
     );
+}
+
+#[test]
+fn test_e2e_kick_idle_and_expired_connections() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr").to_string();
+
+    let config = Config {
+        bind_address: addr.clone(),
+        worker_count: 1,
+        sandbox_type: SandboxType::Mock,
+        l2_redis_ttl_secs: 1, // 1 second secret_key TTL
+        client_idle_timeout: Duration::from_secs(5),
+        ..Config::default()
+    };
+
+    let server = Arc::new(BrokerServer::new(config));
+    let server_clone = Arc::clone(&server);
+
+    thread::spawn(move || {
+        let _ = server_clone.run_listener(listener);
+    });
+
+    thread::sleep(Duration::from_millis(50));
+
+    let mut stream = TcpStream::connect(&addr).expect("connect");
+    let local_peer = stream.local_addr().expect("local addr");
+    let default_client_id = format!("client-{}", local_peer);
+    let mut reader = BufReader::new(stream.try_clone().expect("clone"));
+
+    // 1. Client registers -> present in peer_auth_map
+    let _sk = register_client_json(&mut stream, &mut reader);
+    assert!(
+        server.auth_manager.has_connection(&default_client_id),
+        "Registered connection must be tracked in peer_auth_map"
+    );
+
+    // 2. Client sits completely idle until the 1-second secret_key TTL expires:
+    // Server must proactively send ERR Session expired and close the TCP socket!
+    let mut disconnect_msg = String::new();
+    let bytes = reader.read_line(&mut disconnect_msg).expect("read expiry notice");
+    assert!(bytes > 0, "Expected disconnect error line from server");
+    assert!(
+        disconnect_msg.contains("Session expired"),
+        "Expected Session expired notice, got: {}",
+        disconnect_msg
+    );
+
+    // Next read on socket must return 0 (EOF -> socket closed by server)
+    let mut eof_buf = String::new();
+    let eof_bytes = reader.read_line(&mut eof_buf).expect("read EOF");
+    assert_eq!(eof_bytes, 0, "Server must close TCP socket after kicking client");
+
+    // 3. Verify client was kicked out of peer_auth_map
+    thread::sleep(Duration::from_millis(30));
+    assert!(
+        !server.auth_manager.has_connection(&default_client_id),
+        "Kicked connection must be removed from peer_auth_map"
+    );
+
+    server.shutdown();
 }

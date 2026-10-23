@@ -2,10 +2,11 @@
 """
 CLI Client for Sandboxed Job Execution Broker (v2).
 Supports:
+  - Automatic REGISTER handshake to obtain a server-issued secret_key (or --secret-key reuse)
   - Submitting any file from disk to execute remotely
   - Auto-detecting language from file extension (.py, .sh, .js)
   - Optional stdin input
-  - Immediate non-blocking submission + asynchronous polling
+  - Immediate non-blocking submission + asynchronous authenticated polling
 """
 
 import argparse
@@ -23,15 +24,17 @@ EXTENSION_TO_LANG = {
     ".mjs": "node",
 }
 
+
 def detect_language(filepath: str) -> str:
     _, ext = os.path.splitext(filepath)
     ext = ext.lower()
     return EXTENSION_TO_LANG.get(ext, "python")
 
+
 def run_client(
     filepath: str = None,
     language: str = None,
-    client_id: str = "client-user",
+    secret_key: str = None,
     timeout_secs: int = 10,
     stdin_data: str = None,
     server_host: str = "127.0.0.1",
@@ -58,15 +61,34 @@ def run_client(
         s.connect((server_host, server_port))
     except Exception as e:
         print(f"Error: Could not connect to broker at {server_host}:{server_port}: {e}")
-        print("Make sure the broker is running: cargo run -- --local 127.0.0.1:7000")
+        print("Make sure the broker is running: cargo run -- --async --local 127.0.0.1:7000")
         sys.exit(1)
 
     reader = s.makefile("r", encoding="utf-8")
 
-    # 1. Submit job via JSON
+    # 0. Register with the broker if no secret_key was supplied
+    if not secret_key:
+        reg_payload = {"action": "REGISTER"}
+        s.sendall((json.dumps(reg_payload) + "\n").encode("utf-8"))
+        reg_line = reader.readline()
+        try:
+            reg_resp = json.loads(reg_line)
+            secret_key = reg_resp.get("secret_key")
+        except Exception as e:
+            print(f"Error parsing REGISTER response: {reg_line} ({e})")
+            s.close()
+            sys.exit(1)
+
+        if not secret_key:
+            print(f"[Client] Registration failed: {reg_resp}")
+            s.close()
+            sys.exit(1)
+        print(f"[Client] Registered with broker! Issued secret_key: {secret_key[:12]}...")
+
+    # 1. Submit job via JSON using secret_key
     job_payload = {
         "action": "SUBMIT",
-        "client_id": client_id,
+        "secret_key": secret_key,
         "language": lang,
         "code": code,
         "stdin": stdin_data or "",
@@ -92,13 +114,16 @@ def run_client(
     print(f"[Client] Job accepted! Assigned Job ID: {job_id}")
     print("[Client] Connection was NOT blocked. Polling for results...")
 
-    # 2. Asynchronously poll for the result
-    start_poll = time.time()
+    # 2. Asynchronously poll for the result with secret_key
     while True:
-        poll_payload = {"action": "POLL", "job_id": job_id}
+        poll_payload = {"action": "POLL", "secret_key": secret_key, "job_id": job_id}
         s.sendall((json.dumps(poll_payload) + "\n").encode("utf-8"))
         res_line = reader.readline()
         res = json.loads(res_line)
+
+        if res.get("status") == "error":
+            print(f"[Client] Poll error: {res.get('error')}")
+            break
 
         status = res.get("status")
 
@@ -106,6 +131,7 @@ def run_client(
             duration = res.get("execution_duration_ms")
             print(f"\n{'='*50}")
             print(f"Status:   {status}")
+            print(f"Owner ID: {res.get('client_id', '')[:16]}... (SHA-256)")
             print(f"Exit:     {res.get('exit_code')}")
             if duration is not None:
                 print(f"Duration: {duration} ms")
@@ -127,6 +153,7 @@ def run_client(
 
     s.close()
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Submit a code file to the Sandboxed Job Execution Broker."
@@ -141,9 +168,11 @@ def main():
         help="Language (python, sh, node). Auto-detected from file extension if omitted.",
     )
     parser.add_argument(
-        "--client",
-        default="client-user",
-        help="Client ID for multi-tenant fairness scheduling (default: 'client-user')",
+        "--secret-key",
+        "--key",
+        dest="secret_key",
+        default=None,
+        help="Optional existing server-issued secret_key (registers a new key if omitted)",
     )
     parser.add_argument(
         "--timeout",
@@ -183,12 +212,13 @@ def main():
     run_client(
         filepath=args.file,
         language=args.lang,
-        client_id=args.client,
+        secret_key=args.secret_key,
         timeout_secs=args.timeout,
         stdin_data=stdin_content,
         server_host=args.host,
         server_port=args.port,
     )
+
 
 if __name__ == "__main__":
     main()

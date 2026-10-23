@@ -139,7 +139,7 @@ get_memory_kb() {
 }
 
 # Verify connectivity via nc
-PING_CHECK=$(printf "PING\n" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | tr -d '\r\n')
+PING_CHECK=$(printf "PING\n" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | head -n 1 | tr -d '\r\n')
 if [[ "$PING_CHECK" != *PONG* ]]; then
     echo -e "${RED}Error: Broker at ${HOST}:${PORT} did not respond to PING.${NC}"
     exit 1
@@ -243,13 +243,14 @@ echo -e "${PURPLE}--- BROKER FUNCTIONALITY PROBE UNDER THREAD LOAD ---${NC}"
 echo -e "Testing if broker can still process jobs while ${#NC_PIDS[@]} idle threads are blocked..."
 
 T0=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))')
-PROBE_JOB=$(printf "SUBMIT probe_user python print('probe_ok')\n" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | tr -d ':\r\n')
+PROBE_KEY=$(printf "REGISTER\n" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | head -n 1 | tr -d '+\r\n')
+PROBE_JOB=$(printf "SUBMIT %s python print('probe_ok')\n" "$PROBE_KEY" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | head -n 1 | tr -d ':\r\n')
 
 if [[ "$PROBE_JOB" == -ERR* ]] || [ -z "$PROBE_JOB" ]; then
     echo -e "${RED}✗ Probe submission failed: ${PROBE_JOB}${NC}"
 else
     while true; do
-        POLL_RESP=$(printf "POLL %s\n" "$PROBE_JOB" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | tr -d '\r')
+        POLL_RESP=$(printf "POLL %s %s\n" "$PROBE_KEY" "$PROBE_JOB" | nc -w 3 "$HOST" "$PORT" 2>/dev/null | head -n 1 | tr -d '\r')
         if [[ "$POLL_RESP" == +Done* ]]; then
             T1=$(perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))')
             echo -e "${GREEN}✓ Probe job succeeded in $(( T1 - T0 )) ms!${NC} (Worker pool still functions normally)"
@@ -258,7 +259,7 @@ else
             echo -e "${RED}✗ Probe poll failed: ${POLL_RESP}${NC}"
             break
         fi
-        sleep 0.04
+        sleep 0.05
     done
 fi
 

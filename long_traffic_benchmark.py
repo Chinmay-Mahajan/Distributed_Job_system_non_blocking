@@ -434,7 +434,7 @@ class JobRecord:
 # ==============================================================================
 
 class BrokerClient:
-    """Manages a persistent TCP connection to the broker with automatic reconnection."""
+    """Manages a persistent TCP connection to the broker with automatic registration and reconnection."""
 
     def __init__(self, host: str, port: int, timeout: float = 15.0):
         self.host = host
@@ -442,6 +442,7 @@ class BrokerClient:
         self.timeout = timeout
         self.sock: Optional[socket.socket] = None
         self.reader = None
+        self.secret_key: Optional[str] = None
         self.submits_count = 0
         self.polls_count = 0
 
@@ -451,6 +452,17 @@ class BrokerClient:
         self.sock.settimeout(self.timeout)
         self.sock.connect((self.host, self.port))
         self.reader = self.sock.makefile("r", encoding="utf-8")
+
+        if not self.secret_key:
+            reg_cmd = json.dumps({"action": "REGISTER"}) + "\n"
+            self.sock.sendall(reg_cmd.encode("utf-8"))
+            reg_line = self.reader.readline()
+            if not reg_line:
+                raise ConnectionResetError("Empty response on REGISTER")
+            reg_data = json.loads(reg_line)
+            self.secret_key = reg_data.get("secret_key")
+            if not self.secret_key:
+                raise RuntimeError(f"Failed to REGISTER secret_key: {reg_line.strip()}")
 
     def close(self):
         if self.reader:
@@ -470,12 +482,12 @@ class BrokerClient:
         if self.sock is None:
             self.connect()
 
-    def submit_job(self, client_id: str, language: str, code: str, timeout_secs: int = 15) -> Tuple[Optional[str], Optional[str]]:
-        """Submits a job and returns (job_id, error_message)."""
+    def submit_job(self, _client_id: str, language: str, code: str, timeout_secs: int = 15) -> Tuple[Optional[str], Optional[str]]:
+        """Submits an authenticated job and returns (job_id, error_message)."""
         self.ensure_connected()
         req = {
             "action": "SUBMIT",
-            "client_id": client_id,
+            "secret_key": self.secret_key,
             "language": language,
             "code": code,
             "timeout_secs": timeout_secs,
@@ -491,16 +503,16 @@ class BrokerClient:
             if "job_id" in resp_data:
                 return resp_data["job_id"], None
             elif resp_data.get("status") == "error":
-                return None, resp_data.get("message", "Unknown error")
+                return None, resp_data.get("error") or resp_data.get("message", "Unknown error")
             return None, f"Unexpected response: {resp_line.strip()}"
         except Exception as e:
             self.close()
             return None, str(e)
 
     def poll_result(self, job_id: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-        """Polls for job result and returns (result_dict, error_message)."""
+        """Polls for job result using secret_key and returns (result_dict, error_message)."""
         self.ensure_connected()
-        req = {"action": "POLL", "job_id": job_id}
+        req = {"action": "POLL", "secret_key": self.secret_key, "job_id": job_id}
         raw_cmd = json.dumps(req) + "\n"
         try:
             self.polls_count += 1
@@ -509,6 +521,8 @@ class BrokerClient:
             if not resp_line:
                 raise ConnectionResetError("Empty response on poll")
             resp_data = json.loads(resp_line)
+            if resp_data.get("status") == "error":
+                return None, resp_data.get("error", "Poll error")
             return resp_data, None
         except Exception as e:
             self.close()

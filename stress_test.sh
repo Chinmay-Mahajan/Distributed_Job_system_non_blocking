@@ -21,11 +21,11 @@
 
 set -uo pipefail
 
-# Default configuration
+DEFAULT_POLL_INTERVAL="0.08"
 HOST="127.0.0.1"
 PORT=7000
 PRESET="standard"
-POLL_INTERVAL="0.04"
+POLL_INTERVAL="$DEFAULT_POLL_INTERVAL"
 QUIET=0
 TIMEOUT_NC=5
 
@@ -109,12 +109,17 @@ get_time_ms() {
     perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))'
 }
 
+# Helper to send a single-line command via nc and return immediately upon receiving the response line
+send_nc() {
+    printf "%s\n" "$1" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | head -n 1 | tr -d '\r\n'
+}
+
 # Check broker connectivity via nc
 echo -e "${CYAN}=== Distributed Job Execution Broker Stress Test ===${NC}"
 echo -e "Target Server: ${BOLD}${HOST}:${PORT}${NC}"
 echo -e "Testing connectivity via 'nc'..."
 
-PING_RESP=$(printf "PING\n" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | tr -d '\r\n')
+PING_RESP=$(send_nc "PING")
 if [[ "$PING_RESP" != "+PONG" && "$PING_RESP" != *"PONG"* ]]; then
     echo -e "${RED}Error: Could not connect to broker at ${HOST}:${PORT}.${NC}"
     echo -e "Response was: '${PING_RESP}'"
@@ -127,7 +132,7 @@ fi
 echo -e "${GREEN}✓ Broker is alive (PING -> ${PING_RESP})${NC}"
 
 # Fetch pre-test scheduler stats
-PRE_STATS=$(printf "STATS\n" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | tr -d '\r\n')
+PRE_STATS=$(send_nc "STATS")
 echo -e "Initial Broker Stats: ${PRE_STATS}"
 echo ""
 
@@ -180,12 +185,13 @@ get_workload() {
 # ==============================================================================
 # Client Worker Engine
 # ==============================================================================
-# Submits a single job via nc, polls via nc until terminal state, and logs metrics.
+# Submits a single job via nc using secret_key, polls via nc until terminal state, and logs metrics.
 submit_and_poll_job() {
     local client_id="$1"
-    local client_tier="$2"
-    local job_num="$3"
-    local workload_def="$4"
+    local secret_key="$2"
+    local client_tier="$3"
+    local job_num="$4"
+    local workload_def="$5"
 
     local job_type=$(echo "$workload_def" | cut -d'|' -f1)
     local job_lang=$(echo "$workload_def" | cut -d'|' -f2)
@@ -193,8 +199,8 @@ submit_and_poll_job() {
 
     local t_submit_ms=$(get_time_ms)
 
-    # 1. Submit request via nc
-    local submit_resp=$(printf "SUBMIT %s %s %s\n" "$client_id" "$job_lang" "$job_code" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | tr -d '\r\n')
+    # 1. Authenticated Submit request via nc
+    local submit_resp=$(send_nc "SUBMIT ${secret_key} ${job_lang} ${job_code}")
 
     local job_id=""
     if [[ "$submit_resp" == :* ]]; then
@@ -215,9 +221,9 @@ submit_and_poll_job() {
         echo -e "${BLUE}[${client_id}]${NC} SUBMIT #${job_num} [${job_type}] -> ${job_id:0:8}..."
     fi
 
-    # 2. Asynchronously poll via nc until Done / Failed / TimedOut
+    # 2. Asynchronously poll via nc with secret_key until Done / Failed / TimedOut
     while true; do
-        local poll_resp=$(printf "POLL %s\n" "$job_id" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | tr -d '\r')
+        local poll_resp=$(send_nc "POLL ${secret_key} ${job_id}")
 
         case "$poll_resp" in
             +Done*|+Failed*|+TimedOut*)
@@ -261,6 +267,9 @@ else:
                 fi
                 break
                 ;;
+            *Poll\ rate\ limit\ exceeded*)
+                sleep 0.25
+                ;;
             -ERR*)
                 if [ "$QUIET" -eq 0 ]; then
                     echo -e "${RED}[${client_id}] POLL ERROR on #${job_num} (${job_id:0:8}): ${poll_resp}${NC}"
@@ -282,6 +291,14 @@ simulate_client() {
     local submit_interval="$4"
     local complex_ratio="$5" # e.g. 50 for 50% complex
 
+    # Register client once to obtain server-issued secret_key
+    local reg_resp=$(send_nc "REGISTER")
+    local secret_key="${reg_resp#+}"
+    if [[ -z "$secret_key" || "$secret_key" == -ERR* ]]; then
+        echo -e "${RED}[${client_id}] REGISTER FAILED: ${reg_resp}${NC}"
+        return
+    fi
+
     for i in $(seq 1 "$num_requests"); do
         # Determine whether this job should be complex or simple
         local mode="simple"
@@ -292,7 +309,7 @@ simulate_client() {
         local workload=$(get_workload "$i" "$mode")
 
         # Submit and poll asynchronously in background so client frequency is maintained!
-        submit_and_poll_job "$client_id" "$client_tier" "$i" "$workload" &
+        submit_and_poll_job "$client_id" "$secret_key" "$client_tier" "$i" "$workload" &
 
         sleep "$submit_interval"
     done
@@ -388,7 +405,7 @@ echo -e "Total Wall-Clock Time: ${BOLD}${TOTAL_ELAPSED_SEC}s${NC} (${TOTAL_ELAPS
 echo ""
 
 # Query post-test broker stats via nc
-POST_STATS=$(printf "STATS\n" | nc -w "$TIMEOUT_NC" "$HOST" "$PORT" 2>/dev/null | tr -d '\r\n')
+POST_STATS=$(send_nc "STATS")
 echo -e "Final Broker Stats: ${POST_STATS}"
 echo ""
 

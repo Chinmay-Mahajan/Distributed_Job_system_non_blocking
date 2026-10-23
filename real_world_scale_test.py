@@ -147,6 +147,19 @@ class TenantWorker(threading.Thread):
             s.settimeout(8.0)
             s.connect((self.host, self.port))
             reader = s.makefile("r")
+
+            # Register to obtain server-issued secret_key
+            reg_req = json.dumps({"action": "REGISTER"}) + "\n"
+            s.sendall(reg_req.encode())
+            reg_line = reader.readline()
+            if not reg_line:
+                s.close()
+                return
+            reg_resp = json.loads(reg_line)
+            secret_key = reg_resp.get("secret_key")
+            if not secret_key:
+                s.close()
+                return
         except Exception:
             return
 
@@ -185,7 +198,7 @@ class TenantWorker(threading.Thread):
                 t_submit = time.time()
                 submit_req = json.dumps({
                     "action": "SUBMIT",
-                    "client_id": self.client_id,
+                    "secret_key": secret_key,
                     "language": lang,
                     "code": code,
                     "timeout_secs": 15,
@@ -213,7 +226,7 @@ class TenantWorker(threading.Thread):
                     time.sleep(self.poll_interval)
                     polls += 1
 
-                    poll_req = json.dumps({"action": "POLL", "job_id": job_id}) + "\n"
+                    poll_req = json.dumps({"action": "POLL", "secret_key": secret_key, "job_id": job_id}) + "\n"
                     try:
                         s.sendall(poll_req.encode())
                         line = reader.readline()
@@ -221,6 +234,9 @@ class TenantWorker(threading.Thread):
                             s.close()
                             return
                         poll_resp = json.loads(line)
+                        if poll_resp.get("status") == "error" and "Poll rate limit" in poll_resp.get("error", ""):
+                            time.sleep(0.20)
+                            continue
                         st = poll_resp.get("status")
                         if st in ("Done", "Failed", "TimedOut"):
                             t_done = time.time()
@@ -426,7 +442,7 @@ def main():
         help="Persistent idle connections maintained alongside active clients (default: 50)",
     )
     parser.add_argument("--duration", type=float, default=10.0, help="Seconds to test each client scale (default: 10s)")
-    parser.add_argument("--poll-interval", type=float, default=0.03, help="Polling interval in seconds (default: 0.03s = 30ms)")
+    parser.add_argument("--poll-interval", type=float, default=0.05, help="Polling interval in seconds (default: 0.05s = 50ms)")
     parser.add_argument("--server-pid", type=int, default=0, help="Broker process PID for tracking threads/memory (auto-detected if 0)")
     parser.add_argument("--csv", default="", help="Optional CSV file path to export all individual job latency records")
 

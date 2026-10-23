@@ -40,6 +40,7 @@ pub struct Config {
     pub max_polls_per_sec: u32,
     pub max_poll_strikes: u32,
     pub l2_penalty_ttl_secs: u64,
+    pub client_idle_timeout: Duration,
 }
 
 impl Default for Config {
@@ -73,6 +74,7 @@ impl Default for Config {
             max_polls_per_sec: 25,
             max_poll_strikes: 3,
             l2_penalty_ttl_secs: 60,
+            client_idle_timeout: Duration::from_secs(300), // 5 minutes max inactivity before kicking idle client
         }
     }
 }
@@ -145,6 +147,9 @@ impl Config {
         }
         if let Ok(Ok(val)) = std::env::var("DISTJOB_L2_PENALTY_SECS").map(|v| v.parse::<u64>()) {
             config.l2_penalty_ttl_secs = val;
+        }
+        if let Ok(Ok(val)) = std::env::var("DISTJOB_IDLE_TIMEOUT_SECS").map(|v| v.parse::<u64>()) {
+            config.client_idle_timeout = Duration::from_secs(val);
         }
 
         config

@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
@@ -149,6 +150,17 @@ impl Drop for AsyncBrokerServer {
     }
 }
 
+struct AsyncConnectionCleanupGuard {
+    auth_manager: Arc<AuthManager>,
+    default_client_id: String,
+}
+
+impl Drop for AsyncConnectionCleanupGuard {
+    fn drop(&mut self) {
+        self.auth_manager.remove_connection(&self.default_client_id);
+    }
+}
+
 /// Asynchronous connection handler loop.
 /// Yields execution back to Tokio whenever waiting for client socket bytes.
 async fn handle_connection_async(
@@ -158,16 +170,54 @@ async fn handle_connection_async(
     auth_manager: Arc<AuthManager>,
     config: Config,
 ) -> std::io::Result<()> {
-    let peer_addr = stream.peer_addr()?;
+    let peer_addr = stream.peer_addr()?; // the addr of the client connecting to the server 
     let default_client_id = format!("client-{}", peer_addr);
+    auth_manager.init_connection(&default_client_id);
+    let _cleanup_guard = AsyncConnectionCleanupGuard {
+        auth_manager: Arc::clone(&auth_manager),
+        default_client_id: default_client_id.clone(),
+    };
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut key_expires_at: Option<Instant> = None;
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
+
+        // Enforce both the per-connection idle timeout and the issued secret_key lifetime deadline
+        let mut wait_duration = config.client_idle_timeout;
+        if let Some(deadline) = key_expires_at {
+            let remaining_key_ttl = deadline.saturating_duration_since(Instant::now());
+            if remaining_key_ttl.is_zero() {
+                let err_resp = format_error(
+                    "Session expired: secret_key TTL elapsed, disconnecting",
+                    ProtocolFormat::Text,
+                );
+                let _ = writer.write_all(err_resp.as_bytes()).await;
+                let _ = writer.flush().await;
+                break;
+            }
+            wait_duration = wait_duration.min(remaining_key_ttl);
+        }
+
+        let bytes_read = match tokio::time::timeout(wait_duration, reader.read_line(&mut line)).await
+        {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                let reason = if key_expires_at.is_some_and(|d| Instant::now() >= d) {
+                    "Session expired: secret_key TTL elapsed, disconnecting"
+                } else {
+                    "Connection idle timeout exceeded, disconnecting"
+                };
+                let err_resp = format_error(reason, ProtocolFormat::Text);
+                let _ = writer.write_all(err_resp.as_bytes()).await;
+                let _ = writer.flush().await;
+                break;
+            }
+        };
         if bytes_read == 0 {
             // Client closed connection cleanly
             break;
@@ -190,8 +240,15 @@ async fn handle_connection_async(
 
         match parsed.command {
             ClientCommand::Register => {
-                let secret_key = auth_manager.register_async().await;
-                let resp = format_register_ok(&secret_key, parsed.format);
+                let resp = match auth_manager.register_for_client_async(&default_client_id).await {
+                    Ok(secret_key) => {
+                        key_expires_at = Some(
+                            Instant::now() + Duration::from_secs(config.l2_redis_ttl_secs),
+                        );
+                        format_register_ok(&secret_key, parsed.format)
+                    }
+                    Err(err_msg) => format_error(&err_msg, parsed.format),
+                };
                 writer.write_all(resp.as_bytes()).await?;
             }
 
@@ -309,5 +366,6 @@ async fn handle_connection_async(
         writer.flush().await?;
     }
 
+    auth_manager.remove_connection(&default_client_id);
     Ok(())
 }

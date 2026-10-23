@@ -3,6 +3,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use crate::auth::AuthManager;
@@ -142,6 +143,17 @@ impl Drop for BrokerServer {
     }
 }
 
+struct ConnectionCleanupGuard {
+    auth_manager: Arc<AuthManager>,
+    default_client_id: String,
+}
+
+impl Drop for ConnectionCleanupGuard {
+    fn drop(&mut self) {
+        self.auth_manager.remove_connection(&self.default_client_id);
+    }
+}
+
 fn handle_connection(
     stream: TcpStream,
     scheduler: Arc<TwoLevelScheduler>,
@@ -149,16 +161,59 @@ fn handle_connection(
     auth_manager: Arc<AuthManager>,
     config: Config,
 ) -> std::io::Result<()> {
-    let peer_addr = stream.peer_addr()?;
+    let peer_addr = stream.peer_addr()?; // addr IP+port of the client connecting to the server
     let default_client_id = format!("client-{}", peer_addr);
+    auth_manager.init_connection(&default_client_id);
+    let _cleanup_guard = ConnectionCleanupGuard {
+        auth_manager: Arc::clone(&auth_manager),
+        default_client_id: default_client_id.clone(),
+    };
 
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
+    let mut key_expires_at: Option<Instant> = None;
 
     loop {
         line.clear();
-        let bytes_read = reader.read_line(&mut line)?;
+
+        // Enforce both the per-connection idle timeout and the issued secret_key lifetime deadline
+        let mut wait_duration = config.client_idle_timeout;
+        if let Some(deadline) = key_expires_at {
+            let remaining_key_ttl = deadline.saturating_duration_since(Instant::now());
+            if remaining_key_ttl.is_zero() {
+                let err_resp = format_error(
+                    "Session expired: secret_key TTL elapsed, disconnecting",
+                    ProtocolFormat::Text,
+                );
+                let _ = writer.write_all(err_resp.as_bytes());
+                let _ = writer.flush();
+                break;
+            }
+            wait_duration = wait_duration.min(remaining_key_ttl);
+        }
+
+        writer.set_read_timeout(Some(wait_duration))?;
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let reason = if key_expires_at.is_some_and(|d| Instant::now() >= d) {
+                    "Session expired: secret_key TTL elapsed, disconnecting"
+                } else {
+                    "Connection idle timeout exceeded, disconnecting"
+                };
+                let err_resp = format_error(reason, ProtocolFormat::Text);
+                let _ = writer.write_all(err_resp.as_bytes());
+                let _ = writer.flush();
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         if bytes_read == 0 {
             // Client closed connection
             break;
@@ -181,8 +236,15 @@ fn handle_connection(
 
         match parsed.command {
             ClientCommand::Register => {
-                let secret_key = auth_manager.register();
-                let resp = format_register_ok(&secret_key, parsed.format);
+                let resp = match auth_manager.register_for_client(&default_client_id) {
+                    Ok(secret_key) => {
+                        key_expires_at = Some(
+                            Instant::now() + Duration::from_secs(config.l2_redis_ttl_secs),
+                        );
+                        format_register_ok(&secret_key, parsed.format)
+                    }
+                    Err(err_msg) => format_error(&err_msg, parsed.format),
+                };
                 writer.write_all(resp.as_bytes())?;
             }
 
@@ -296,5 +358,6 @@ fn handle_connection(
         writer.flush()?;
     }
 
+    auth_manager.remove_connection(&default_client_id);
     Ok(())
 }

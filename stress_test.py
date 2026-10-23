@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-Multi-Tenant Traffic Simulator & Stress Testing Suite for Sandboxed Job Execution Broker.
+Multi-Tenant Traffic Simulator & Stress Testing Suite for Sandboxed Job Execution Broker (v2).
 
-This script connects to the broker (optionally invoking 'nc' directly or using sockets),
-spawns multiple simulated clients with asymmetric traffic frequencies (high, medium, low),
-dispatches a mixed workload of simple/short and complex/heavy code jobs, and calculates
-detailed turnaround and queue latency statistics for every client.
-
-Strictly preserves server architecture without modifications.
+Compatible with the Two-Tier L1 (Heap) + L2 (Redis) Authentication & Poll Rate-Limiting architecture:
+  1. Each simulated tenant registers via 'REGISTER' to obtain a unique server-issued secret_key.
+  2. All SUBMIT and POLL commands authenticate using that tenant's secret_key.
+  3. Respects per-user polling rate limits (backing off automatically if a burst triggers a poll strike).
 """
 
 import argparse
 import json
-import math
-import os
-import shutil
+import socket
 import statistics
-import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List
 
 WORKLOAD_POOL = {
     "simple": [
@@ -41,27 +36,34 @@ WORKLOAD_POOL = {
 
 
 class NcClient:
-    """Communicates with the broker by invoking the 'nc' system utility."""
+    """Communicates with the broker using line-oriented text protocol commands."""
 
     def __init__(self, host: str, port: int, timeout: int = 5):
         self.host = host
-        self.port = port
+        self.port = int(port)
         self.timeout = timeout
 
     def send_command(self, cmd: str) -> str:
-        """Pipes a command to 'nc' and returns the stripped response."""
+        """Sends a text protocol command and returns the single-line response immediately."""
         try:
-            proc = subprocess.Popen(
-                ["nc", "-w", str(self.timeout), self.host, str(self.port)],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stdout, _ = proc.communicate(input=cmd + "\n", timeout=self.timeout + 1)
-            return stdout.strip()
+            with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
+                s.sendall((cmd + "\n").encode("utf-8"))
+                with s.makefile("r", encoding="utf-8") as reader:
+                    return reader.readline().strip()
         except Exception as e:
             return f"-ERR {e}"
+
+    def register_key(self) -> str:
+        """Registers a new client with the broker and returns its server-issued secret_key."""
+        resp = self.send_command("REGISTER")
+        if resp.startswith("+"):
+            return resp[1:].strip()
+        if '"secret_key"' in resp:
+            try:
+                return json.loads(resp).get("secret_key", "")
+            except Exception:
+                pass
+        raise RuntimeError(f"Failed to REGISTER secret_key from broker: {resp}")
 
 
 class JobRecord:
@@ -90,7 +92,7 @@ class JobRecord:
 
 
 def run_client_worker(
-    client_id: str,
+    client_label: str,
     tier: str,
     num_requests: int,
     submit_interval: float,
@@ -101,14 +103,23 @@ def run_client_worker(
     records_list: List[JobRecord],
     verbose: bool,
 ):
-    """Simulates a single client thread issuing requests at specified frequency intervals."""
+    """Simulates a single authenticated tenant issuing requests at specified frequency intervals."""
+    try:
+        secret_key = nc.register_key()
+    except Exception as e:
+        print(f"[{client_label}] REGISTER ERROR: {e}")
+        return
+
+    if verbose:
+        print(f"[{client_label}] Registered -> {secret_key[:14]}...")
+
     threads: List[threading.Thread] = []
 
     def submit_and_poll(job_num: int, jtype: str, jlang: str, jcode: str):
         t0 = int(time.time() * 1000)
 
-        # 1. SUBMIT via nc
-        cmd = f"SUBMIT {client_id} {jlang} {jcode}"
+        # 1. Authenticated SUBMIT
+        cmd = f"SUBMIT {secret_key} {jlang} {jcode}"
         submit_resp = nc.send_command(cmd)
 
         job_id = None
@@ -122,15 +133,15 @@ def run_client_worker(
 
         if not job_id:
             if verbose:
-                print(f"[{client_id}] SUBMIT ERROR #{job_num}: {submit_resp}")
+                print(f"[{client_label}] SUBMIT REJECTED #{job_num}: {submit_resp}")
             return
 
         if verbose:
-            print(f"[{client_id}] SUBMIT #{job_num:02d} [{jtype}] -> {job_id[:8]}...")
+            print(f"[{client_label}] SUBMIT #{job_num:02d} [{jtype}] -> {job_id[:8]}...")
 
-        # 2. POLL via nc until terminal state
+        # 2. Authenticated POLL until terminal state
         while True:
-            poll_resp = nc.send_command(f"POLL {job_id}")
+            poll_resp = nc.send_command(f"POLL {secret_key} {job_id}")
             if any(poll_resp.startswith(prefix) for prefix in ("+Done", "+Failed", "+TimedOut")):
                 t1 = int(time.time() * 1000)
                 status = "Unknown"
@@ -151,7 +162,7 @@ def run_client_worker(
                         pass
 
                 rec = JobRecord(
-                    client_id=client_id,
+                    client_id=client_label,
                     tier=tier,
                     job_num=job_num,
                     job_type=jtype,
@@ -167,13 +178,16 @@ def run_client_worker(
 
                 if verbose:
                     print(
-                        f"[{client_id}] DONE   #{job_num:02d} [{jtype}] | "
+                        f"[{client_label}] DONE   #{job_num:02d} [{jtype}] | "
                         f"Wait: {rec.wait_time_ms:4d}ms | Exec: {exec_dur:4d}ms | Queue: {queue_wait:4d}ms | {status}"
                     )
                 break
+            elif "Poll rate limit exceeded" in poll_resp:
+                # Back off for 250ms if concurrent polls for this tenant hit the per-sec poll quota
+                time.sleep(0.25)
             elif poll_resp.startswith("-ERR"):
                 if verbose:
-                    print(f"[{client_id}] POLL ERR #{job_num}: {poll_resp}")
+                    print(f"[{client_label}] POLL ERR #{job_num}: {poll_resp}")
                 break
             else:
                 time.sleep(poll_interval)
@@ -212,7 +226,7 @@ def print_report(records: List[JobRecord], elapsed_sec: float, pre_stats: str, p
     print("                        CLIENT WAIT TIME & LATENCY PERFORMANCE REPORT")
     print("=" * 110)
     print(
-        f"{'Client ID':<18} {'Tier':<10} {'Reqs':<5} {'Done':<5} {'Avg Wait':<11} {'Min':<8} {'P50':<8} "
+        f"{'Client Label':<18} {'Tier':<10} {'Reqs':<5} {'Done':<5} {'Avg Wait':<11} {'Min':<8} {'P50':<8} "
         f"{'P95':<8} {'Max':<8} {'Avg Exec':<11} {'Avg Queue':<11}"
     )
     print("-" * 110)
@@ -291,8 +305,8 @@ def print_report(records: List[JobRecord], elapsed_sec: float, pre_stats: str, p
         print(f"[FAIRNESS CONFIRMED] Low-frequency clients experienced {ratio:.1f}x lower average wait time")
         print("                     than high-frequency spamming clients.")
         print("  -> Why? The Two-Level Scheduler successfully enforced the per-client in-flight cap")
-        print("     (max_in_flight_per_client) on heavy clients, preventing them from monopolizing")
-        print("     worker threads and ensuring low-frequency clients were serviced without starvation.")
+        print("     (max_in_flight_per_client) keyed by SHA-256(secret_key), preventing heavy clients")
+        print("     from monopolizing worker threads and servicing low-frequency clients without starvation.")
     else:
         print("[FAIRNESS OBSERVATION] Workloads completed with low queue contention across all tiers.")
     print("=" * 80)
@@ -311,8 +325,8 @@ def main():
     parser.add_argument(
         "--poll-interval",
         type=float,
-        default=0.04,
-        help="Polling delay in seconds (default: 0.04)",
+        default=0.08,
+        help="Polling delay in seconds (default: 0.08)",
     )
     parser.add_argument(
         "--quiet",
@@ -321,20 +335,15 @@ def main():
     )
     args = parser.parse_args()
 
-    # Check for nc
-    if not shutil.which("nc"):
-        print("Error: 'nc' (netcat) executable not found in PATH.")
-        sys.exit(1)
-
     nc = NcClient(args.host, args.port)
 
     # Health check
-    print(f"Connecting to broker at {args.host}:{args.port} via 'nc'...")
+    print(f"Connecting to broker at {args.host}:{args.port}...")
     ping_resp = nc.send_command("PING")
     if "+PONG" not in ping_resp:
         print(f"Error: Broker server at {args.host}:{args.port} not responding (Response: '{ping_resp}').")
         print("Start the broker in another terminal:")
-        print(f"  cargo run -- --local {args.host}:{args.port}")
+        print(f"  cargo run -- --async --local {args.host}:{args.port}")
         sys.exit(1)
 
     print("✓ Broker is alive!")
