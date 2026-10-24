@@ -131,6 +131,12 @@ The broker provides two complete, interchangeable server implementations selecta
   - In both models, network I/O is strictly decoupled from sandbox execution.
   - On `SUBMIT`: Once authenticated and admitted by the scheduler, the server records a `Pending` entry in [`ResultStore`](src/store.rs), enqueues the job in [`TwoLevelScheduler`](src/scheduler.rs), and returns the `job_id` immediately without waiting for execution.
   - Heavy container execution runs exclusively on the fixed-size [`WorkerPool`](src/worker.rs), ensuring high network polling rates never starve container execution and heavy container jobs never block the network reactor.
+- **Bounded Ingress Framing (`MAX_LINE_BYTES = 64 KB`) & Smart Buffer Reuse:**
+  - Both connection loops wrap socket line reads with `.take((MAX_LINE_BYTES + 1) as u64)` (`std::io::Read` in Sync, `tokio::io::AsyncReadExt` in Async). If a client streams more than `64 KB` without a `\n` delimiter, the broker immediately rejects the frame (`Too big payload` / `Payload too big`) and closes the socket before JSON deserialization or heap amplification can occur.
+  - Each connection pre-allocates a `1 KB` (`String::with_capacity(1024)`) buffer—handling 99% of commands (`REGISTER`, `POLL`, `STATUS`, normal `SUBMIT`) with zero heap reallocations while keeping per-connection memory minimal under C10K load—and automatically resets capacity back to `1 KB` (`line = String::with_capacity(1024)`) whenever a spike exceeds `64 KB`.
+- **Proactive Idle & Key-Expiry Connection Eviction:**
+  - Both the synchronous (`TcpStream::set_read_timeout`) and asynchronous (`tokio::time::timeout`) socket loops enforce a dual deadline of `min(client_idle_timeout, remaining_key_ttl)`.
+  - If a client sits idle beyond `client_idle_timeout` (`300s`) or its issued `secret_key` reaches `l2_redis_ttl_secs` (`3600s`), the server sends a disconnect notice, purges all unpopped results belonging to that client's `key_hash` from `ResultStore`, closes the TCP socket, and cleans up `peer_auth_map` via an RAII drop guard (`ConnectionCleanupGuard` / `AsyncConnectionCleanupGuard`).
 
 ---
 
@@ -145,6 +151,7 @@ To solve this cleanly:
 2. **One-Way Cryptographic Hashing (`SHA-256`):** The broker immediately computes `key_hash = SHA-256(secret_key)` (64-character hex digest). **The raw `secret_key` is never stored in server heap memory or Redis.**
 3. **Immutable Tenant Identity:** On every `SUBMIT`, `POLL`, and `STATUS` command, the client supplies `secret_key`. The broker hashes it to `key_hash` and uses `key_hash` as the authoritative `client_id` inside [`Job`](src/model.rs), [`TwoLevelScheduler`](src/scheduler.rs), and [`ResultStore`](src/store.rs).
 4. **Job Ownership Verification (AuthZ):** When a client calls `POLL` or `STATUS` for a `job_id`, the server verifies `result.client_id == key_hash`. Attempts to access another tenant's job are rejected immediately with `Unauthorized: job belongs to another client`.
+5. **Per-Connection `REGISTER` Guard (`peer_auth_map`):** Each accepted TCP connection (`default_client_id = client-<ip>:<port>`) is initialized to `false` in `peer_auth_map: RwLock<HashMap<String, bool>>` upon connecting and flipped to `true` on its first `REGISTER` call. Subsequent `REGISTER`/`AUTH` attempts on the same connection are rejected (`Already registered`), preventing a client from minting multiple `secret_key` tokens over a single socket while allowing distinct connections from the same IP (different ephemeral ports) to register independently.
 
 #### 3.2.2 L1 (In-Process Heap) + L2 (Redis Logical DB `1`) Cache Hierarchy
 ```mermaid
@@ -358,11 +365,14 @@ Result management lives in [`src/store.rs`](src/store.rs).
  └─────────┘└─────────┘└──────────┘
 ```
 
-#### Memory Management with TTL & Lock Sharding:
-Without an expiration mechanism, clients that submit jobs but never poll would cause unbound memory growth.
-- Every entry in `ResultStore` is stamped with an `expires_at = Instant::now() + TTL` (default: 600s / 10 minutes) and stores `client_id: key_hash` for strict ownership checks.
-- **Two-Tier Purging:**
-  - **Passive Purge on Read:** If `get(job_id)` is invoked after expiry, the entry is immediately evicted and returns `None`.
+#### Memory Management with Pop-on-Poll, DTO Projection, FIFO Shard Caps & Lock Sharding:
+Without strict lifecycle boundaries, clients that submit high-throughput jobs or never poll could cause unbounded memory growth in [`ResultStore`](src/store.rs). Version 2 enforces five layers of `ResultStore` memory protection:
+- **DTO Projection (Zero Input Retention):** [`JobResult`](src/model.rs) stores only execution metadata and output (`job_id`, `client_id`, `status`, `stdout`, `stderr`, `exit_code`, `error_message`, timestamps)—never retaining a duplicate copy of the submitted `code` or `stdin` strings in `ResultStore`.
+- **Owner-Verified Pop-on-Poll (`poll_for_client`):** Once a job reaches a terminal state (`Done`, `Failed`, `TimedOut`) and the rightful owner (`result.client_id == key_hash`) calls `POLL`, the result is immediately popped (removed) from `ResultStore` upon delivery.
+- **Bounded Shard Capacity (`DEFAULT_MAX_SHARD_RESULTS = 256`):** Each of the 32 shards enforces a hard capacity cap. If an active client submits jobs rapidly without polling and fills a shard, `insert_pending` first prunes expired entries and then evicts the oldest completed result (`inserted_at` FIFO).
+- **Disconnect & Expiry Purge (`remove_client_results`):** When a connection is kicked due to `client_idle_timeout` or `secret_key` TTL expiration, all unpopped results belonging to `active_key_hash` are immediately purged across all 32 shards.
+- **Two-Tier TTL Purging (`result_ttl = 600s`):**
+  - **Passive Purge on Read:** If `get(job_id)` or `poll_for_client` is invoked after expiry, the entry is immediately evicted and returns `None`.
   - **Active Background Janitor:** A lightweight background thread awakens every `cleanup_interval` (default: 30s) and scans the store, pruning stale entries.
 - **Lock Sharding (Striping) with `RwLock`:**
   - Instead of a single monolithic lock, entries are striped across $S=32$ independent shards: $\text{shard} = \text{hash}(\text{job\_id}) \ \& \ (S - 1)$.

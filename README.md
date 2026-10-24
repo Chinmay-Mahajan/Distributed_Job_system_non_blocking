@@ -81,7 +81,8 @@ flowchart TD
   * When a client reaches `max_poll_strikes` (default `3`), the broker **evicts the client from the L1 heap cache** and writes `penalty:<key_hash> = 1` (`EX 60s`) into L2 Redis. While on probation, L2 hits are **not** re-promoted to L1, protecting L1 heap capacity for well-behaved tenants.
 * **Strict Cross-Tenant Job Ownership (AuthZ):** Every `POLL` and `STATUS` query verifies `result.client_id == key_hash`, preventing any tenant from inspecting or polling another user's job outputs.
 * **Per-Connection `REGISTER` Guard (`peer_auth_map`):** Each accepted TCP connection (`default_client_id = client-<ip>:<port>`) is tracked in `peer_auth_map: RwLock<HashMap<String, bool>>` (initialized to `false` on connect, flipped to `true` on the first `REGISTER`). Calling `REGISTER` / `AUTH` more than once on the same connection is immediately rejected (`Already registered`), preventing a client from minting multiple `secret_key` tokens on one socket to bypass per-client in-flight or polling quotas while still allowing separate connections from the same host IP (distinct ephemeral ports) to register independently.
-* **Proactive Idle & Key-Expiry Connection Eviction:** Both the synchronous (`TcpStream::set_read_timeout`) and asynchronous (`tokio::time::timeout`) socket loops enforce a dual deadline of `min(client_idle_timeout, remaining_key_ttl)`. If a client sits idle past `client_idle_timeout` (default `300s`) or its issued `secret_key` reaches `l2_redis_ttl_secs` (`3600s`), the server proactively sends an `ERR` disconnect notice, closes the TCP socket, and guarantees cleanup of `peer_auth_map` via an RAII drop guard (`ConnectionCleanupGuard` / `AsyncConnectionCleanupGuard`).
+* **Proactive Idle & Key-Expiry Connection Eviction:** Both the synchronous (`TcpStream::set_read_timeout`) and asynchronous (`tokio::time::timeout`) socket loops enforce a dual deadline of `min(client_idle_timeout, remaining_key_ttl)`. If a client sits idle past `client_idle_timeout` (default `300s`) or its issued `secret_key` reaches `l2_redis_ttl_secs` (`3600s`), the server proactively sends an `ERR` disconnect notice, purges any unpopped job results belonging to that client's `key_hash` from `ResultStore`, closes the TCP socket, and guarantees cleanup of `peer_auth_map` via an RAII drop guard (`ConnectionCleanupGuard` / `AsyncConnectionCleanupGuard`).
+* **Bounded TCP Ingress Framing (`MAX_LINE_BYTES = 64 KB`) & Buffer Reuse:** Socket line reads are strictly bounded via `.take((MAX_LINE_BYTES + 1) as u64)` (`std::io::Read` in Sync, `tokio::io::AsyncReadExt` in Async). Any request frame exceeding `64 KB` without a newline is immediately rejected and disconnected before JSON parsing or heap amplification can occur. Each connection pre-allocates a `1 KB` buffer (`String::with_capacity(1024)`) for zero-reallocation handling of normal commands and automatically resets capacity back to `1 KB` after any large payload spike.
 
 ### 2.2 Two-Queue $O(1)$ Fair Scheduler
 * **Instantaneous $O(1)$ Dispatch:** Workers never scan through an $O(N)$ list of clients skipping saturated tenants under a shared mutex. Workers pop eligible tenants directly from [`dispatchable_queue`](src/scheduler.rs).
@@ -112,9 +113,12 @@ The broker supports two interchangeable connection models toggleable at startup 
 * **Broker-Enforced Hard Timeout:** A broker supervisor thread monitors wall-clock execution against `timeout_secs`, killing runaway containers or processes and recording `TimedOut`.
 * **Safe Stdin EOF Transmission:** Decoupled pipe lifecycle ensuring standard input EOF is reliably delivered to container processes.
 
-### 2.6 Automated Lifecycle Management & Lock Sharding
-* Completed job outputs reside in an in-memory, lock-striped [`ResultStore`](src/store.rs) partitioned into 32 independent shards, eliminating lock contention between concurrent worker writes and poller reads.
-* An asynchronous background reaper periodically sweeps and evicts expired records shard-by-shard, preventing stop-the-world latency spikes and memory leaks.
+### 2.6 Automated Lifecycle Management, Pop-on-Poll & Lock Sharding
+* **32-Shard Lock Striping:** Completed job outputs reside in an in-memory, lock-striped [`ResultStore`](src/store.rs) partitioned into 32 independent shards, eliminating lock contention between concurrent worker writes and poller reads.
+* **Zero Input Retention (DTO Projection):** [`JobResult`](src/model.rs) stores only execution state and output (`job_id`, `client_id`, `status`, `stdout`, `stderr`, `exit_code`, `error_message`, timestamps)—never retaining duplicate copies of submitted `code` or `stdin` payloads in `ResultStore`.
+* **Owner-Verified Pop-on-Poll (`poll_for_client`):** Once a job reaches a terminal state (`Done`, `Failed`, or `TimedOut`) and the rightful owner (`result.client_id == key_hash`) calls `POLL`, the result is immediately popped (removed) from `ResultStore` upon delivery.
+* **Bounded Shard Capacity & Disconnect Purge:** Each shard is capped at `DEFAULT_MAX_SHARD_RESULTS` (`256` entries/shard), evicting expired entries first and falling back to FIFO eviction of the oldest completed result if a client submits jobs without polling. Additionally, when a connection is kicked on idle timeout or key expiry, `remove_client_results` purges all unpopped results for that client across all shards.
+* **Background TTL Reaper:** An asynchronous background reaper periodically sweeps and evicts expired records shard-by-shard, preventing stop-the-world latency spikes and memory leaks.
 
 ---
 
@@ -232,7 +236,7 @@ The broker natively supports two wire protocols over the same TCP listener:
 ```json
 {"action": "POLL", "secret_key": "sk_9c8b1a2e4f3d4b5c8a7e6f5d4c3b2a10", "job_id": "a9844f25-82b5-4b36-a1a2-cb31a61c33f2"}
 ```
-**Response:**
+**Response (Popped from `ResultStore` once terminal):**
 ```json
 {
   "job_id": "a9844f25-82b5-4b36-a1a2-cb31a61c33f2",
@@ -242,13 +246,6 @@ The broker natively supports two wire protocols over the same TCP listener:
   "stderr": "",
   "exit_code": 0,
   "error_message": null,
-  "job": {
-    "client_id": "e44e628a3c22186e4e6f7ccab624df3bc121099e96e1492fc3e0d21ebd898392",
-    "language": "python",
-    "code": "print(2 ** 10)",
-    "stdin": "",
-    "timeout_secs": 5
-  },
   "created_at_ms": 1711468000000,
   "completed_at_ms": 1711468000050,
   "execution_duration_ms": 50
@@ -366,3 +363,10 @@ python3 stress_test.py --preset light
 # High-concurrency heavy stress test (6 clients, 128 burst requests)
 ./stress_test.sh --preset heavy
 ```
+
+### 8.6 Local Testing Workbench GUI (`testing_gui/`)
+```bash
+# Launch the zero-dependency HTTP-to-TCP testing workbench on http://127.0.0.1:8080
+python3 testing_gui/app.py --port 8080 --broker-host 127.0.0.1 --broker-port 7000
+```
+Open **[http://127.0.0.1:8080](http://127.0.0.1:8080)** to interactively manage persistent TCP sockets (`peer_auth_map`), test single-socket duplicate `REGISTER` rejection, watch idle/key-expired connections get kicked, submit jobs with custom payload padding, and inspect live `STATS` and wire transcripts.
