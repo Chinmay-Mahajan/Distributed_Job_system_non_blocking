@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
@@ -17,6 +17,8 @@ use crate::sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox};
 use crate::scheduler::TwoLevelScheduler;
 use crate::store::ResultStore;
 use crate::worker::WorkerPool;
+
+const MAX_LINE_BYTES : usize = 64*1024; 
 
 /// Asynchronous Broker Server implementation using Tokio.
 ///
@@ -180,17 +182,27 @@ async fn handle_connection_async(
 
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut line = String::with_capacity(1024);
     let mut key_expires_at: Option<Instant> = None;
+    let mut active_key_hash: Option<String> = None;
 
     loop {
-        line.clear();
+        // SO Earlier we wrote the data in string line ,  since a String in rust is a wrapper around a Vec<u8> when this Vec grows bigger than the capacity rust requests the OS for a 2xCapcity sized chunk of memoery on the heap. So had we not bounded the data being read then we would have an evergrowing heap structure . Which could trigger a SIGKILL on the server itself , taking the entire server down. 
+        if line.capacity()>64*1024{ 
+            line = String::with_capacity(1024);
+        }
+        else{
+            line.clear();
+        }
 
         // Enforce both the per-connection idle timeout and the issued secret_key lifetime deadline
         let mut wait_duration = config.client_idle_timeout;
         if let Some(deadline) = key_expires_at {
             let remaining_key_ttl = deadline.saturating_duration_since(Instant::now());
             if remaining_key_ttl.is_zero() {
+                if let Some(ref kh) = active_key_hash {
+                    result_store.remove_client_results(kh);
+                }
                 let err_resp = format_error(
                     "Session expired: secret_key TTL elapsed, disconnecting",
                     ProtocolFormat::Text,
@@ -202,11 +214,25 @@ async fn handle_connection_async(
             wait_duration = wait_duration.min(remaining_key_ttl);
         }
 
-        let bytes_read = match tokio::time::timeout(wait_duration, reader.read_line(&mut line)).await
+        // should add a limit on how much data our server reads before it reads a \n 
+        let bytes_read = match tokio::time::timeout(wait_duration,(&mut reader).take((MAX_LINE_BYTES+1) as u64).read_line(&mut line)).await
         {
-            Ok(Ok(n)) => n,
+            Ok(Ok(n)) => {
+                if n>MAX_LINE_BYTES{
+                    let err = format_error("Payload too big", ProtocolFormat::Text); 
+                    let _ = writer.write_all(err.as_bytes()).await;
+                    let _ = writer.flush().await;
+                    break;
+
+                }
+
+                n
+            },
             Ok(Err(e)) => return Err(e),
             Err(_elapsed) => {
+                if let Some(ref kh) = active_key_hash {
+                    result_store.remove_client_results(kh);
+                }
                 let reason = if key_expires_at.is_some_and(|d| Instant::now() >= d) {
                     "Session expired: secret_key TTL elapsed, disconnecting"
                 } else {
@@ -245,6 +271,7 @@ async fn handle_connection_async(
                         key_expires_at = Some(
                             Instant::now() + Duration::from_secs(config.l2_redis_ttl_secs),
                         );
+                        active_key_hash = Some(AuthManager::hash_key(&secret_key));
                         format_register_ok(&secret_key, parsed.format)
                     }
                     Err(err_msg) => format_error(&err_msg, parsed.format),
@@ -268,6 +295,7 @@ async fn handle_connection_async(
                         continue;
                     }
                 };
+                active_key_hash = Some(key_hash.clone());
 
                 let job_id = Uuid::new_v4().to_string();
                 let effective_timeout = timeout_secs
@@ -307,18 +335,10 @@ async fn handle_connection_async(
                     }
                 };
 
-                let resp = match result_store.get(&job_id) {
-                    Some(result) => {
-                        if result.client_id != key_hash {
-                            format_error(
-                                "Unauthorized: job belongs to another client",
-                                parsed.format,
-                            )
-                        } else {
-                            format_poll_ok(&result, parsed.format)
-                        }
-                    }
-                    None => format_error("Job not found or expired", parsed.format),
+                let resp = match result_store.poll_for_client(&job_id, &key_hash) {
+                    Ok(Some(result)) => format_poll_ok(&result, parsed.format),
+                    Ok(None) => format_error("Job not found or expired", parsed.format),
+                    Err(err_msg) => format_error(err_msg, parsed.format),
                 };
                 writer.write_all(resp.as_bytes()).await?;
             }

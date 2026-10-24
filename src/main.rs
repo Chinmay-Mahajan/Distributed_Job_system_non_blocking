@@ -138,6 +138,7 @@ fn main() -> std::io::Result<()> {
 
     if config.enable_async_server {
         let rt = tokio::runtime::Builder::new_multi_thread()
+            .thread_name("My TOKIO THREADS")
             .enable_all()
             .build()?;
 

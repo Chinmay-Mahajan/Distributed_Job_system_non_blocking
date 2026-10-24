@@ -11,13 +11,13 @@ use crate::config::Config;
 
 const DEFAULT_L1_SHARDS: usize = 32;
 
-/// Per-user session metadata stored in the fast L1 (in-process heap) cache.
+// each users data like the ones listed below are stored in the L1 cache (this lives on the heap of the server process , l1 is cheap and fast to access). 
 #[derive(Debug, Clone)]
 pub struct L1Session {
     pub last_active: Instant,
     pub window_start: Instant,
-    pub polls_in_window: u32,
-    pub violation_strikes: u32,
+    pub polls_in_window: u32, // we would set a polls / sec limit so that users who poll contionusly (attempting to keep themselves in the l1 cache) get demoted to l2 cache. 
+    pub violation_strikes: u32, // if the user has violated said num of strikes we would evict them out of the  l1 cache .
 }
 
 impl L1Session {
@@ -50,7 +50,8 @@ struct FallbackL2Entry {
 ///   are evicted from L1 and marked with `penalty:<key_hash>` in L2 Redis, preventing L1 re-promotion
 ///   until their probation TTL expires.
 pub struct AuthManager {
-    l1_shards: Vec<RwLock<HashMap<String, L1Session>>>,
+    l1_shards: Vec<RwLock<HashMap<String, L1Session>>>, // since we would end up reading the cache more often that we write to it is hence bwtter to use a RWlock over a mutex (mutex has read exclusiveness as well). And sharding the cache to prevent lock contention (multiple workers competing for the same lock)
+    
     shard_capacity: usize,
     l1_ttl: Duration,
     l2_redis_ttl_secs: u64,
@@ -58,11 +59,12 @@ pub struct AuthManager {
     max_poll_strikes: u32,
     l2_penalty_ttl_secs: u64,
     redis_client: Option<redis::Client>,
-    async_redis_conn: tokio::sync::RwLock<Option<redis::aio::MultiplexedConnection>>,
+    async_redis_conn: tokio::sync::RwLock<Option<redis::aio::MultiplexedConnection>>, // since here the context is the async redis con we use the tokio::sync instead of the std::sync . Reason : when a thread aquires a write lock that thread is b;ocked until someother thread gives up the guard. Here when we acquire the lock , our task yeilds control back to the executor loop . 
     fallback_l2: RwLock<HashMap<String, FallbackL2Entry>>,
     /// Maps each connection's `default_client_id` (`client-<peer_addr>`) -> `bool` (initial `false`).
     /// Prevents a single connection from calling `REGISTER`/`AUTH` multiple times to mint multiple keys.
-    peer_auth_map: RwLock<HashMap<String, bool>>,
+    peer_auth_map: RwLock<HashMap<String, bool>>, 
+    // we use this to track whether a conenction has recently called AUTH 
 }
 
 impl AuthManager {

@@ -13,15 +13,19 @@ use crate::model::{Job, JobResult, JobState};
 /// lock contention between worker threads and client pollers.
 pub const DEFAULT_SHARDS: usize = 32;
 
+/// Maximum stored results per shard before Option B FIFO/oldest eviction kicks in.
+pub const DEFAULT_MAX_SHARD_RESULTS: usize = 256;
+
 struct StoredEntry {
     result: JobResult,
-    _inserted_at: Instant,
+    inserted_at: Instant,
     expires_at: Instant,
 }
 
 pub struct ResultStore {
-    shards: Vec<RwLock<HashMap<String, StoredEntry>>>,
+    shards: Vec<RwLock<HashMap<String, StoredEntry>>>, // storing job id - StoredEntry 
     shard_mask: usize,
+    max_shard_capacity: usize,
     // A rwlock is used here and not a mutex as a mutex is blocks all the other threads from even reading when one is reading the shared data . 
     // a rwlock allows multiple thread to read at once as long as they dont mutate the shared data . maintains a reader and also a writer lock so more overhead .
     // but but but in this case the read ops on the shared hashmap dominate the write ops .
@@ -64,6 +68,7 @@ impl ResultStore {
         Self {
             shards,
             shard_mask: num_shards - 1,
+            max_shard_capacity: DEFAULT_MAX_SHARD_RESULTS,
             ttl,
         }
     }
@@ -83,16 +88,48 @@ impl ResultStore {
     }
 
     /// Record a newly submitted job in `Pending` state.
+    /// Enforces bounded shard capacity: if the shard is at capacity,
+    /// evicts expired entries first, or the oldest completed result in the shard.
     pub fn insert_pending(&self, job: &Job) {
         let now = Instant::now();
         let entry = StoredEntry {
             result: JobResult::new_pending(job),
-            _inserted_at: now,
+            inserted_at: now,
             expires_at: now + self.ttl,
         };
 
         let shard = self.shard_for(&job.id);
         let mut lock = shard.write().unwrap(); // acquire write lock on this shard only
+
+        if !lock.contains_key(&job.id) && lock.len() >= self.max_shard_capacity {
+            // 1. Evict any expired entries in this shard first
+            lock.retain(|_, v| now < v.expires_at);
+
+            // 2. If still at capacity, evict the oldest completed (Done/Failed/TimedOut) entry,
+            //    or fallback to the oldest entry in the shard (Option B FIFO eviction).
+            if lock.len() >= self.max_shard_capacity {
+                let oldest_completed_key = lock
+                    .iter()
+                    .filter(|(_, v)| {
+                        matches!(
+                            v.result.status,
+                            JobState::Done | JobState::Failed | JobState::TimedOut
+                        )
+                    })
+                    .min_by_key(|(_, v)| v.inserted_at)
+                    .map(|(k, _)| k.clone())
+                    .or_else(|| {
+                        lock.iter()
+                            .min_by_key(|(_, v)| v.inserted_at)
+                            .map(|(k, _)| k.clone())
+                    });
+
+                if let Some(evict_key) = oldest_completed_key {
+                    lock.remove(&evict_key);
+                }
+            }
+        }
+
         lock.insert(job.id.clone(), entry);
     }
 
@@ -160,6 +197,60 @@ impl ResultStore {
         }
 
         None
+    }
+
+    /// Owner-verified Pop-on-Poll:
+    /// - If the job does not exist or is expired, returns `Ok(None)`.
+    /// - If `entry.result.client_id != client_id`, returns `Err(...)` without removing the job.
+    /// - If the job is in a terminal state (`Done`, `Failed`, `TimedOut`), removes (pops) it
+    ///   from `ResultStore` and returns `Ok(Some(result))`.
+    /// - If the job is still `Pending` or `Running`, returns a clone and keeps it in the store.
+    pub fn poll_for_client(
+        &self,
+        job_id: &str,
+        client_id: &str,
+    ) -> Result<Option<JobResult>, &'static str> {
+        let now = Instant::now();
+        let shard = self.shard_for(job_id);
+        let mut lock = shard.write().unwrap();
+
+        let Some(entry) = lock.get(job_id) else {
+            return Ok(None);
+        };
+
+        if now >= entry.expires_at {
+            lock.remove(job_id);
+            return Ok(None);
+        }
+
+        if entry.result.client_id != client_id {
+            return Err("Unauthorized: job belongs to another client");
+        }
+
+        let is_terminal = matches!(
+            entry.result.status,
+            JobState::Done | JobState::Failed | JobState::TimedOut
+        );
+
+        if is_terminal {
+            let popped = lock.remove(job_id).unwrap();
+            Ok(Some(popped.result))
+        } else {
+            Ok(Some(entry.result.clone()))
+        }
+    }
+
+    /// Purges all unpopped results belonging to `client_id` across all shards
+    /// (called when a client is kicked due to inactivity or secret_key expiration).
+    pub fn remove_client_results(&self, client_id: &str) -> usize {
+        let mut removed = 0;
+        for shard in &self.shards {
+            let mut lock = shard.write().unwrap();
+            let before = lock.len();
+            lock.retain(|_, entry| entry.result.client_id != client_id);
+            removed += before - lock.len();
+        }
+        removed
     }
 
     /// Remove all expired entries across all shards.

@@ -1,4 +1,4 @@
-use distributed_jobv2::model::{ClientCommand, JobRequest, JobResult, JobState};
+use distributed_jobv2::model::{ClientCommand, JobResult, JobState};
 use distributed_jobv2::protocol::{
     format_poll_ok, format_pong, format_register_ok, format_status_ok, format_submit_ok,
     parse_line, ProtocolFormat,
@@ -136,13 +136,6 @@ fn test_formatters() {
         stderr: "".into(),
         exit_code: Some(0),
         error_message: None,
-        job: JobRequest {
-            client_id: "e44e628a3c22186e4e6f7ccab624df3bc121099e96e1492fc3e0d21ebd898392".into(),
-            language: "python".into(),
-            code: "pass".into(),
-            stdin: None,
-            timeout_secs: Some(10),
-        },
         created_at_ms: 1000,
         completed_at_ms: Some(1050),
         execution_duration_ms: Some(50),

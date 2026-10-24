@@ -107,7 +107,7 @@ fn test_e2e_json_submit_and_poll() {
     let final_res = completed_result.expect("job should complete within 2.5s");
     assert_eq!(final_res.status, JobState::Done);
     assert!(final_res.stdout.contains("hello from e2e test"));
-    assert_eq!(final_res.job.client_id, expected_hash);
+    assert_eq!(final_res.client_id, expected_hash);
 }
 
 #[test]
@@ -659,11 +659,26 @@ fn test_e2e_kick_idle_and_expired_connections() {
     let default_client_id = format!("client-{}", local_peer);
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
 
-    // 1. Client registers -> present in peer_auth_map
-    let _sk = register_client_json(&mut stream, &mut reader);
+    // 1. Client registers and submits a job without ever polling it
+    let sk = register_client_json(&mut stream, &mut reader);
     assert!(
         server.auth_manager.has_connection(&default_client_id),
         "Registered connection must be tracked in peer_auth_map"
+    );
+
+    let submit_req = serde_json::json!({
+        "action": "SUBMIT",
+        "secret_key": sk,
+        "language": "python",
+        "code": "print('unpopped job')"
+    });
+    writeln!(stream, "{}", submit_req).unwrap();
+    let mut sub_line = String::new();
+    reader.read_line(&mut sub_line).unwrap();
+    assert_eq!(
+        server.result_store.count(),
+        1,
+        "Unpopped job should be in ResultStore before client is kicked"
     );
 
     // 2. Client sits completely idle until the 1-second secret_key TTL expires:
@@ -682,11 +697,16 @@ fn test_e2e_kick_idle_and_expired_connections() {
     let eof_bytes = reader.read_line(&mut eof_buf).expect("read EOF");
     assert_eq!(eof_bytes, 0, "Server must close TCP socket after kicking client");
 
-    // 3. Verify client was kicked out of peer_auth_map
+    // 3. Verify client was kicked out of peer_auth_map AND its unpopped jobs were purged from ResultStore
     thread::sleep(Duration::from_millis(30));
     assert!(
         !server.auth_manager.has_connection(&default_client_id),
         "Kicked connection must be removed from peer_auth_map"
+    );
+    assert_eq!(
+        server.result_store.count(),
+        0,
+        "Kicked client's unpopped results must be purged from ResultStore"
     );
 
     server.shutdown();

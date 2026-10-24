@@ -22,7 +22,6 @@ fn test_result_store_lifecycle() {
     let res = store.get("job-100").expect("should exist");
     assert_eq!(res.status, JobState::Pending);
     assert_eq!(res.client_id, "client-1");
-    assert_eq!(res.job.code, "print('hi')");
 
     // 2. Running
     store.set_running("job-100");
@@ -41,12 +40,21 @@ fn test_result_store_lifecycle() {
             duration_ms: 42,
         },
     );
-    let res3 = store.get("job-100").expect("should exist");
+    let res3 = store
+        .poll_for_client("job-100", "client-1")
+        .expect("authorized")
+        .expect("should exist");
     assert_eq!(res3.status, JobState::Done);
     assert_eq!(res3.stdout, "hi\n");
     assert_eq!(res3.exit_code, Some(0));
     assert_eq!(res3.execution_duration_ms, Some(42));
     assert!(res3.completed_at_ms.is_some());
+
+    // 4. Pop-on-Poll: once a terminal job is polled by its owner, it is removed from ResultStore!
+    assert!(
+        store.get("job-100").is_none(),
+        "Terminal job must be popped from ResultStore after owner polls it"
+    );
 }
 
 #[test]

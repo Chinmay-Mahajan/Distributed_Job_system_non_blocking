@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Write , Read};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -17,6 +17,8 @@ use crate::sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox};
 use crate::scheduler::TwoLevelScheduler;
 use crate::store::ResultStore;
 use crate::worker::WorkerPool;
+
+const MAX_LINE_BYTES:usize = 64*1024;
 
 pub struct BrokerServer {
     pub config: Config,
@@ -171,17 +173,27 @@ fn handle_connection(
 
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
-    let mut line = String::new();
+    let mut line = String::with_capacity(1024);
     let mut key_expires_at: Option<Instant> = None;
+    let mut active_key_hash: Option<String> = None;
 
     loop {
-        line.clear();
+        // SO Earlier we wrote the data in string line ,  since a String in rust is a wrapper around a Vec<u8> when this Vec grows bigger than the capacity rust requests the OS for a 2xCapcity sized chunk of memoery on the heap. So had we not bounded the data being read then we would have an evergrowing heap structure . Which could trigger a SIGKILL on the server itself , taking the entire server down. 
+        if line.capacity()>64*1024{ 
+            line = String::with_capacity(1024);
+        }
+        else{
+            line.clear();
+        }
 
         // Enforce both the per-connection idle timeout and the issued secret_key lifetime deadline
         let mut wait_duration = config.client_idle_timeout;
         if let Some(deadline) = key_expires_at {
             let remaining_key_ttl = deadline.saturating_duration_since(Instant::now());
             if remaining_key_ttl.is_zero() {
+                if let Some(ref kh) = active_key_hash {
+                    result_store.remove_client_results(kh);
+                }
                 let err_resp = format_error(
                     "Session expired: secret_key TTL elapsed, disconnecting",
                     ProtocolFormat::Text,
@@ -194,14 +206,28 @@ fn handle_connection(
         }
 
         writer.set_read_timeout(Some(wait_duration))?;
-        let bytes_read = match reader.read_line(&mut line) {
-            Ok(n) => n,
+        let bytes_read = match (&mut reader).take((MAX_LINE_BYTES+1) as u64).read_line(&mut line) {
+            Ok(n) => {
+                if n>MAX_LINE_BYTES{
+                    let err = format_error("Too big payload", ProtocolFormat::Text);
+                    let _ =writer.write_all(err.as_bytes()); 
+                    let _ = writer.flush(); 
+                    break;
+
+                }
+
+                n 
+                
+            },
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                if let Some(ref kh) = active_key_hash {
+                    result_store.remove_client_results(kh);
+                }
                 let reason = if key_expires_at.is_some_and(|d| Instant::now() >= d) {
                     "Session expired: secret_key TTL elapsed, disconnecting"
                 } else {
@@ -241,6 +267,7 @@ fn handle_connection(
                         key_expires_at = Some(
                             Instant::now() + Duration::from_secs(config.l2_redis_ttl_secs),
                         );
+                        active_key_hash = Some(AuthManager::hash_key(&secret_key));
                         format_register_ok(&secret_key, parsed.format)
                     }
                     Err(err_msg) => format_error(&err_msg, parsed.format),
@@ -264,6 +291,7 @@ fn handle_connection(
                         continue;
                     }
                 };
+                active_key_hash = Some(key_hash.clone());
 
                 let timeout = timeout_secs
                     .unwrap_or(config.default_timeout_secs)
@@ -299,18 +327,10 @@ fn handle_connection(
                     }
                 };
 
-                let resp = match result_store.get(&job_id) {
-                    Some(result) => {
-                        if result.client_id != key_hash {
-                            format_error(
-                                "Unauthorized: job belongs to another client",
-                                parsed.format,
-                            )
-                        } else {
-                            format_poll_ok(&result, parsed.format)
-                        }
-                    }
-                    None => format_error("Job not found or expired", parsed.format),
+                let resp = match result_store.poll_for_client(&job_id, &key_hash) {
+                    Ok(Some(result)) => format_poll_ok(&result, parsed.format),
+                    Ok(None) => format_error("Job not found or expired", parsed.format),
+                    Err(err_msg) => format_error(err_msg, parsed.format),
                 };
                 writer.write_all(resp.as_bytes())?;
             }

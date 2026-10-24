@@ -1,0 +1,898 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DistJob v2 — Broker Workbench</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --panel: #111827;
+      --panel-alt: #1a2333;
+      --panel-hover: #243046;
+      --border: #2a364f;
+      --text: #f3f4f6;
+      --muted: #9ca3af;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --green: #10b981;
+      --red: #ef4444;
+      --amber: #f59e0b;
+      --mono: "JetBrains Mono", "Fira Code", "SF Mono", Menlo, Monaco, Consolas, monospace;
+      --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100vw;
+      height: 100vh;
+      overflow: hidden; /* Lock viewport so nothing ever stretches the window */
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Top Telemetry Navbar */
+    header {
+      flex: 0 0 54px;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+      padding: 0 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      min-width: 0;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-weight: 700;
+      font-size: 15px;
+      white-space: nowrap;
+    }
+
+    .badge {
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 600;
+      font-family: var(--mono);
+      letter-spacing: 0.3px;
+    }
+    .badge-online {
+      background: rgba(16, 185, 129, 0.14);
+      color: var(--green);
+      border: 1px solid rgba(16, 185, 129, 0.4);
+    }
+    .badge-offline {
+      background: rgba(239, 68, 68, 0.14);
+      color: var(--red);
+      border: 1px solid rgba(239, 68, 68, 0.4);
+    }
+
+    .stats-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      overflow-x: auto;
+    }
+
+    .stat-pill {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .stat-pill span {
+      color: var(--muted);
+      margin-right: 5px;
+    }
+
+    /* Main Split Workbench Layout */
+    .workspace {
+      flex: 1 1 auto;
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr) minmax(0, 1fr);
+      gap: 12px;
+      padding: 12px;
+      min-height: 0;
+      min-width: 0;
+      overflow: hidden;
+    }
+
+    @media (max-width: 1200px) {
+      .workspace {
+        grid-template-columns: 320px minmax(0, 1fr);
+      }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      flex: 0 0 auto;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      background: rgba(255, 255, 255, 0.015);
+    }
+
+    .panel-title {
+      font-weight: 600;
+      font-size: 13.5px;
+      margin: 0;
+      color: #e5e7eb;
+    }
+
+    .panel-body {
+      flex: 1 1 auto;
+      padding: 14px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 0;
+      min-width: 0;
+    }
+
+    /* Controls & Inputs */
+    button {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 12.5px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.12s ease;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 5px;
+    }
+    button:hover { background: var(--accent-hover); }
+    button:active { transform: translateY(1px); }
+    button.btn-sm { padding: 5px 9px; font-size: 11.5px; }
+    button.btn-secondary {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    button.btn-secondary:hover { background: var(--panel-hover); }
+    button.btn-danger {
+      background: rgba(239, 68, 68, 0.15);
+      border: 1px solid rgba(239, 68, 68, 0.45);
+      color: #fca5a5;
+    }
+    button.btn-danger:hover { background: rgba(239, 68, 68, 0.28); }
+    button.btn-green {
+      background: var(--green);
+      color: #042f1e;
+      font-weight: 700;
+    }
+    button.btn-green:hover { background: #059669; color: #fff; }
+
+    input, select, textarea {
+      width: 100%;
+      background: #060911;
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 8px 10px;
+      font-family: var(--mono);
+      font-size: 12px;
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    input:focus, select:focus, textarea:focus {
+      border-color: var(--accent);
+    }
+
+    label {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 11.5px;
+      color: var(--muted);
+      margin-bottom: 5px;
+      font-weight: 500;
+    }
+
+    .row {
+      display: flex;
+      gap: 10px;
+      align-items: flex-end;
+      min-width: 0;
+    }
+    .row > * {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+
+    /* Code Editor Box */
+    .editor-wrapper {
+      display: flex;
+      flex-direction: column;
+      flex: 1 1 auto;
+      min-height: 150px;
+    }
+    #input-code {
+      flex: 1 1 auto;
+      resize: none;
+      line-height: 1.55;
+      tab-size: 4;
+      white-space: pre;
+      overflow-wrap: normal;
+      overflow-x: auto;
+    }
+
+    /* Connection Cards */
+    .conn-card {
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 10px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      transition: border-color 0.15s;
+    }
+    .conn-card.selected {
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+    .conn-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      gap: 6px;
+    }
+    .sk-pill {
+      background: #060911;
+      border: 1px dashed var(--border);
+      padding: 6px 8px;
+      border-radius: 5px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: #93c5fd;
+      overflow-wrap: anywhere;
+      word-break: break-all;
+    }
+
+    /* Wire Console — strictly bounded so long strings NEVER stretch the screen */
+    .console-container {
+      flex: 1 1 auto;
+      background: #05080f;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      font-family: var(--mono);
+      font-size: 11.5px;
+      overflow-y: auto;
+      overflow-x: hidden;
+      min-height: 0;
+      min-width: 0;
+      max-width: 100%;
+    }
+
+    .log-entry {
+      margin-bottom: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid #151e2e;
+      max-width: 100%;
+      overflow: hidden;
+    }
+    .log-header {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 4px;
+      font-weight: 600;
+    }
+    .log-body {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      max-width: 100%;
+      color: #d1d5db;
+      line-height: 1.45;
+      max-height: 220px;
+      overflow-y: auto;
+      background: rgba(255, 255, 255, 0.02);
+      padding: 6px 8px;
+      border-radius: 4px;
+    }
+    .log-tx { color: #60a5fa; }
+    .log-rx { color: #34d399; }
+    .log-err { color: #f87171; }
+
+    /* Last Poll Result Box */
+    .result-box {
+      flex: 0 0 auto;
+      background: var(--panel-alt);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: 12px;
+      max-height: 210px;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+    .result-pre {
+      margin: 6px 0 0 0;
+      padding: 8px;
+      background: #060911;
+      border-radius: 4px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      max-height: 110px;
+      overflow-y: auto;
+    }
+    .hint {
+      font-size: 11px;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span>Sandboxed Job Broker v2 — Workbench</span>
+      <span id="broker-status" class="badge badge-offline">CHECKING...</span>
+    </div>
+    <div class="stats-bar">
+      <div class="stat-pill"><span>Active Clients:</span><strong id="st-clients">0</strong></div>
+      <div class="stat-pill"><span>Queued:</span><strong id="st-queued">0</strong></div>
+      <div class="stat-pill"><span>In-Flight:</span><strong id="st-inflight">0</strong></div>
+      <div class="stat-pill"><span>Dispatchable:</span><strong id="st-dispatch">0</strong></div>
+      <div class="stat-pill"><span>Waiting:</span><strong id="st-waiting">0</strong></div>
+      <div class="stat-pill"><span>Stored Results:</span><strong id="st-stored">0</strong></div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- COLUMN 1: Persistent TCP Sockets -->
+    <section class="panel">
+      <div class="panel-header">
+        <h3 class="panel-title">1. TCP Connections (`peer_auth_map`)</h3>
+        <button class="btn-sm" onclick="openNewConnection()">+ New TCP Socket</button>
+      </div>
+      <div class="panel-body">
+        <div style="font-size: 12px; color: var(--muted); line-height: 1.4;">
+          Each socket binds a unique ephemeral port (<code class="hint">client-ip:port</code>). Use this to test single-socket <code class="hint">REGISTER</code> limits or watch idle sockets get kicked.
+        </div>
+        <div id="conn-list" style="display:flex; flex-direction:column; gap:10px;"></div>
+      </div>
+    </section>
+
+    <!-- COLUMN 2: Job Submission & Protocol Builder -->
+    <section class="panel">
+      <div class="panel-header">
+        <h3 class="panel-title">2. Job & Command Builder</h3>
+        <div style="display:flex; gap:6px;">
+          <button class="btn-sm btn-secondary" onclick="sendQuickCommand('PING')">PING</button>
+          <button class="btn-sm btn-secondary" onclick="sendQuickCommand('STATS')">STATS</button>
+        </div>
+      </div>
+
+      <div class="panel-body">
+        <div class="row">
+          <div style="flex: 0 0 170px;">
+            <label>Active Socket</label>
+            <select id="active-conn" onchange="onSelectConnChange()"></select>
+          </div>
+          <div>
+            <label>
+              <span>Secret Key (`sk_...`)</span>
+              <span class="hint">Editable</span>
+            </label>
+            <input id="input-sk" type="text" placeholder="Click REGISTER on a socket or type a key..." />
+          </div>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Language</label>
+            <select id="input-lang">
+              <option value="python">python</option>
+              <option value="sh">sh / bash</option>
+              <option value="javascript">javascript (node)</option>
+            </select>
+          </div>
+          <div style="flex: 0 0 130px;">
+            <label>Timeout (secs)</label>
+            <input id="input-timeout" type="number" value="5" min="1" max="60" />
+          </div>
+        </div>
+
+        <div class="editor-wrapper">
+          <label>
+            <span>Code Payload</span>
+            <span class="hint">Tab = 4 spaces | Shift+Tab = Unindent | Cmd/Ctrl+Enter = Submit</span>
+          </label>
+          <textarea id="input-code" spellcheck="false">def compute(n):
+    total = 0
+    for i in range(n):
+        total += i
+    return total
+
+print("Result:", compute(100))</textarea>
+        </div>
+
+        <div class="row">
+          <div>
+            <label>Standard Input (`stdin`)</label>
+            <input id="input-stdin" type="text" placeholder="Optional stdin string..." />
+          </div>
+          <div style="flex: 0 0 185px;">
+            <label>Pad Payload (`KB`)</label>
+            <input id="input-inflate-kb" type="number" value="0" min="0" step="64" />
+          </div>
+          <div style="flex: 0 0 auto;">
+            <button class="btn-green" onclick="submitJob()" style="height:33px;">SUBMIT JOB</button>
+          </div>
+        </div>
+
+        <div class="row" style="border-top: 1px solid var(--border); padding-top: 10px;">
+          <div>
+            <label>Target `job_id` (Auto-filled on SUBMIT)</label>
+            <input id="input-jobid" type="text" placeholder="Job UUID..." />
+          </div>
+          <div style="flex: 0 0 auto; display:flex; gap:6px;">
+            <button class="btn-secondary" onclick="pollJob('STATUS')" style="height:33px;">STATUS</button>
+            <button onclick="pollJob('POLL')" style="height:33px;">POLL RESULT</button>
+          </div>
+        </div>
+
+        <div class="row" style="border-top: 1px solid var(--border); padding-top: 10px;">
+          <div>
+            <label>Raw Wire Line (JSON or Text Protocol)</label>
+            <input id="input-raw" type="text" placeholder='{"action": "REGISTER"} or PING' />
+          </div>
+          <div style="flex: 0 0 auto;">
+            <button class="btn-secondary" onclick="sendRawLine()" style="height:33px;">Send Raw</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- COLUMN 3: Output Inspector & Live Wire Transcript -->
+    <section class="panel">
+      <div class="panel-header">
+        <h3 class="panel-title">3. Execution Output & Wire Log</h3>
+        <button class="btn-sm btn-secondary" onclick="clearConsole()">Clear Log</button>
+      </div>
+
+      <div class="panel-body">
+        <div id="last-result-card" class="result-box" style="display:none;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <strong id="res-status-title">Last Polled Job</strong>
+            <span id="res-meta" class="hint"></span>
+          </div>
+          <div id="res-stdout-wrap" style="display:none;">
+            <div class="hint" style="margin-top:6px; color:#34d399;">stdout:</div>
+            <pre id="res-stdout" class="result-pre"></pre>
+          </div>
+          <div id="res-stderr-wrap" style="display:none;">
+            <div class="hint" style="margin-top:6px; color:#f87171;">stderr:</div>
+            <pre id="res-stderr" class="result-pre" style="color:#fca5a5;"></pre>
+          </div>
+        </div>
+
+        <div id="wire-console" class="console-container"></div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    let connections = [];
+    let selectedConnId = null;
+
+    // Fix Tab / Shift+Tab / Auto-indent inside the Python Code Editor
+    const codeEditor = document.getElementById("input-code");
+    codeEditor.addEventListener("keydown", function (e) {
+      // Cmd+Enter or Ctrl+Enter -> Submit Job immediately
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        e.preventDefault();
+        submitJob();
+        return;
+      }
+
+      if (e.key === "Tab") {
+        e.preventDefault();
+        const start = this.selectionStart;
+        const end = this.selectionEnd;
+        const val = this.value;
+
+        if (!e.shiftKey) {
+          // Insert 4 spaces at cursor
+          this.value = val.substring(0, start) + "    " + val.substring(end);
+          this.selectionStart = this.selectionEnd = start + 4;
+        } else {
+          // Shift+Tab: Remove up to 4 leading spaces on current line
+          const lineStart = val.lastIndexOf("\n", start - 1) + 1;
+          const linePrefix = val.substring(lineStart, start);
+          const match = linePrefix.match(/^ {1,4}/);
+          if (match) {
+            const removeCount = match[0].length;
+            this.value = val.substring(0, lineStart) + val.substring(lineStart + removeCount);
+            this.selectionStart = this.selectionEnd = Math.max(lineStart, start - removeCount);
+          }
+        }
+        return;
+      }
+
+      // Smart Enter: preserve indentation and add 4 spaces after ':'
+      if (e.key === "Enter") {
+        const start = this.selectionStart;
+        const end = this.selectionEnd;
+        const val = this.value;
+        const lineStart = val.lastIndexOf("\n", start - 1) + 1;
+        const currentLine = val.substring(lineStart, start);
+        const indentMatch = currentLine.match(/^[ \t]*/);
+        let indent = indentMatch ? indentMatch[0] : "";
+        if (currentLine.trimEnd().endsWith(":")) {
+          indent += "    ";
+        }
+        if (indent.length > 0) {
+          e.preventDefault();
+          this.value = val.substring(0, start) + "\n" + indent + val.substring(end);
+          this.selectionStart = this.selectionEnd = start + 1 + indent.length;
+        }
+      }
+    });
+
+    function logWire(title, detail, type = "rx") {
+      const box = document.getElementById("wire-console");
+      const div = document.createElement("div");
+      div.className = "log-entry";
+      const time = new Date().toLocaleTimeString();
+      const cls = type === "tx" ? "log-tx" : (type === "err" ? "log-err" : "log-rx");
+
+      // Cap string length in DOM so the browser never lags or stretches
+      let safeDetail = String(detail ?? "");
+      if (safeDetail.length > 1500) {
+        safeDetail = safeDetail.slice(0, 1500) + `\n... [truncated in UI, total ${safeDetail.length.toLocaleString()} chars]`;
+      }
+
+      div.innerHTML = `
+        <div class="log-header ${cls}">
+          <span>${escapeHtml(title)}</span>
+          <span class="hint">${time}</span>
+        </div>
+        <div class="log-body">${escapeHtml(safeDetail)}</div>
+      `;
+      box.prepend(div);
+
+      // Keep max 40 log entries in DOM
+      while (box.children.length > 40) {
+        box.removeChild(box.lastChild);
+      }
+    }
+
+    function showJobResultCard(resObj) {
+      if (!resObj || typeof resObj !== "object" || !resObj.status || !resObj.job_id) return;
+      const card = document.getElementById("last-result-card");
+      card.style.display = "block";
+
+      const title = document.getElementById("res-status-title");
+      const meta = document.getElementById("res-meta");
+      const stdoutWrap = document.getElementById("res-stdout-wrap");
+      const stderrWrap = document.getElementById("res-stderr-wrap");
+
+      const st = resObj.status;
+      const color = st === "Done" ? "#34d399" : (st === "Failed" || st === "TimedOut" ? "#f87171" : "#fbbf24");
+      title.innerHTML = `Job <span style="color:${color}">[${escapeHtml(st)}]</span>`;
+      meta.textContent = `exit: ${resObj.exit_code ?? "—"} | duration: ${resObj.execution_duration_ms ?? "—"} ms`;
+
+      if (resObj.stdout) {
+        stdoutWrap.style.display = "block";
+        document.getElementById("res-stdout").textContent = resObj.stdout;
+      } else {
+        stdoutWrap.style.display = "none";
+      }
+
+      if (resObj.stderr || resObj.error_message) {
+        stderrWrap.style.display = "block";
+        document.getElementById("res-stderr").textContent = resObj.stderr || resObj.error_message;
+      } else {
+        stderrWrap.style.display = "none";
+      }
+    }
+
+    function clearConsole() {
+      document.getElementById("wire-console").innerHTML = "";
+      document.getElementById("last-result-card").style.display = "none";
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
+    }
+
+    async function refreshState() {
+      try {
+        const res = await fetch("/api/state");
+        const data = await res.json();
+
+        const badge = document.getElementById("broker-status");
+        if (data.health && data.health.reachable) {
+          badge.className = "badge badge-online";
+          badge.textContent = `ONLINE (${data.broker})`;
+          const st = data.health.stats || {};
+          document.getElementById("st-clients").textContent = st.active_clients ?? 0;
+          document.getElementById("st-queued").textContent = st.queued_jobs ?? 0;
+          document.getElementById("st-inflight").textContent = st.in_flight_jobs ?? 0;
+          document.getElementById("st-dispatch").textContent = st.dispatchable_clients ?? 0;
+          document.getElementById("st-waiting").textContent = st.waiting_clients ?? 0;
+          document.getElementById("st-stored").textContent = st.stored_results ?? 0;
+        } else {
+          badge.className = "badge badge-offline";
+          badge.textContent = `OFFLINE (${data.broker})`;
+        }
+
+        connections = data.connections || [];
+        renderConnections();
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function renderConnections() {
+      const container = document.getElementById("conn-list");
+      const select = document.getElementById("active-conn");
+
+      if (!selectedConnId && connections.length > 0) {
+        selectedConnId = connections[0].conn_id;
+      }
+
+      container.innerHTML = "";
+      select.innerHTML = "";
+
+      if (connections.length === 0) {
+        container.innerHTML = `<div style="color:var(--muted); font-size:12px;">No open TCP sockets. Click <strong>+ New TCP Socket</strong> above.</div>`;
+        return;
+      }
+
+      for (const c of connections) {
+        const opt = document.createElement("option");
+        opt.value = c.conn_id;
+        opt.textContent = `${c.conn_id} (${c.local_addr}) ${c.alive ? "🟢" : "🔴"}`;
+        if (c.conn_id === selectedConnId) opt.selected = true;
+        select.appendChild(opt);
+
+        const item = document.createElement("div");
+        item.className = `conn-card ${c.conn_id === selectedConnId ? "selected" : ""}`;
+        const statusBadge = c.alive
+          ? `<span style="color:var(--green);">● OPEN (${c.idle_secs}s idle)</span>`
+          : `<span style="color:var(--red);">● KICKED / CLOSED</span>`;
+
+        item.innerHTML = `
+          <div class="conn-top">
+            <span>${escapeHtml(c.conn_id)} <small style="color:var(--muted); font-weight:400;">(${escapeHtml(c.default_client_id)})</small></span>
+            ${statusBadge}
+          </div>
+          <div class="sk-pill">
+            ${c.secret_key ? `secret_key: ${escapeHtml(c.secret_key)}` : `Unregistered (no secret_key minted)`}
+          </div>
+          ${!c.alive && c.last_disconnect_reason ? `<div style="color:#fca5a5; font-family:var(--mono); font-size:11px; overflow-wrap:anywhere;">Reason: ${escapeHtml(c.last_disconnect_reason)}</div>` : ""}
+          <div style="display:flex; gap:6px;">
+            <button class="btn-sm btn-secondary" onclick="selectConnection('${c.conn_id}')">Use Socket</button>
+            <button class="btn-sm" onclick="registerOnConnection('${c.conn_id}')">REGISTER</button>
+            <button class="btn-sm btn-danger" onclick="disconnectSocket('${c.conn_id}')" style="margin-left:auto;">Close</button>
+          </div>
+        `;
+        container.appendChild(item);
+      }
+    }
+
+    function selectConnection(connId) {
+      selectedConnId = connId;
+      const c = connections.find(x => x.conn_id === connId);
+      if (c && c.secret_key) {
+        document.getElementById("input-sk").value = c.secret_key;
+      }
+      renderConnections();
+    }
+
+    function onSelectConnChange() {
+      const val = document.getElementById("active-conn").value;
+      selectConnection(val);
+    }
+
+    async function openNewConnection() {
+      const res = await fetch("/api/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        selectedConnId = data.connection.conn_id;
+        logWire(`Opened Socket ${data.connection.conn_id}`, `Mapped as ${data.connection.default_client_id}`, "tx");
+        await refreshState();
+      } else {
+        logWire("Connect Failed", data.error || "Could not connect to broker", "err");
+      }
+    }
+
+    async function disconnectSocket(connId) {
+      await fetch("/api/disconnect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conn_id: connId }),
+      });
+      if (selectedConnId === connId) selectedConnId = null;
+      logWire(`Closed Socket ${connId}`, "Disconnected by user.", "err");
+      await refreshState();
+    }
+
+    async function registerOnConnection(connId) {
+      selectedConnId = connId;
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          conn_id: connId,
+          payload: { action: "REGISTER" },
+        }),
+      });
+      const data = await res.json();
+      logWire(`TX [${connId}] REGISTER`, data.sent, "tx");
+      if (data.response && data.response.raw) {
+        const isErr = data.response.raw.includes('"error"') || data.response.raw.startsWith("-ERR");
+        logWire(`RX [${connId}]`, data.response.raw, isErr ? "err" : "rx");
+        if (data.connection && data.connection.secret_key) {
+          document.getElementById("input-sk").value = data.connection.secret_key;
+        }
+      } else {
+        logWire(`Error [${connId}]`, data.response?.error || data.error, "err");
+      }
+      await refreshState();
+    }
+
+    async function ensureConnection() {
+      if (!selectedConnId || !connections.find(c => c.conn_id === selectedConnId && c.alive)) {
+        await openNewConnection();
+      }
+      return selectedConnId;
+    }
+
+    async function submitJob() {
+      const connId = await ensureConnection();
+      const sk = document.getElementById("input-sk").value.trim();
+      const language = document.getElementById("input-lang").value;
+      const code = document.getElementById("input-code").value;
+      const stdin = document.getElementById("input-stdin").value;
+      const timeout_secs = parseInt(document.getElementById("input-timeout").value || "5", 10);
+      const inflate_kb = parseInt(document.getElementById("input-inflate-kb").value || "0", 10);
+
+      const payload = {
+        action: "SUBMIT",
+        secret_key: sk,
+        language,
+        code,
+        stdin: stdin ? stdin : undefined,
+        timeout_secs,
+      };
+
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conn_id: connId, payload, inflate_kb }),
+      });
+      const data = await res.json();
+      const meta = data.response?.bytes_sent
+        ? ` (${(data.response.bytes_sent / 1024).toFixed(1)} KB in ${data.response.elapsed_ms} ms)`
+        : "";
+      logWire(`TX [${connId}] SUBMIT${meta}`, data.sent, "tx");
+      if (data.response && data.response.raw) {
+        const rj = data.response.json;
+        const isErr = rj?.status === "error" || data.response.raw.startsWith("-ERR");
+        logWire(`RX [${connId}]`, JSON.stringify(rj || data.response.raw, null, 2), isErr ? "err" : "rx");
+        if (rj && rj.job_id) {
+          document.getElementById("input-jobid").value = rj.job_id;
+        }
+      } else {
+        logWire(`Error [${connId}]`, data.response?.error || data.error, "err");
+      }
+      await refreshState();
+    }
+
+    async function pollJob(action = "POLL") {
+      const connId = await ensureConnection();
+      const sk = document.getElementById("input-sk").value.trim();
+      const job_id = document.getElementById("input-jobid").value.trim();
+      const payload = { action, secret_key: sk, job_id };
+
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conn_id: connId, payload }),
+      });
+      const data = await res.json();
+      logWire(`TX [${connId}] ${action}`, data.sent, "tx");
+      if (data.response && data.response.raw) {
+        const rj = data.response.json;
+        const isErr = rj?.status === "error" || data.response.raw.startsWith("-ERR");
+        logWire(`RX [${connId}]`, JSON.stringify(rj || data.response.raw, null, 2), isErr ? "err" : "rx");
+        if (action === "POLL" && rj && rj.job_id) {
+          showJobResultCard(rj);
+        }
+      } else {
+        logWire(`Error [${connId}]`, data.response?.error || data.error, "err");
+      }
+      await refreshState();
+    }
+
+    async function sendQuickCommand(action) {
+      const connId = await ensureConnection();
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conn_id: connId, payload: { action } }),
+      });
+      const data = await res.json();
+      logWire(`TX [${connId}] ${action}`, data.sent, "tx");
+      logWire(`RX [${connId}]`, JSON.stringify(data.response?.json || data.response?.raw, null, 2), "rx");
+      await refreshState();
+    }
+
+    async function sendRawLine() {
+      const connId = await ensureConnection();
+      const raw_line = document.getElementById("input-raw").value;
+      const inflate_kb = parseInt(document.getElementById("input-inflate-kb").value || "0", 10);
+      const res = await fetch("/api/send", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ conn_id: connId, raw_line, inflate_kb }),
+      });
+      const data = await res.json();
+      const meta = data.response?.bytes_sent
+        ? ` (${(data.response.bytes_sent / 1024).toFixed(1)} KB in ${data.response.elapsed_ms} ms)`
+        : "";
+      logWire(`TX [${connId}] RAW${meta}`, data.sent, "tx");
+      logWire(`RX [${connId}]`, data.response?.raw || data.response?.error, data.response?.ok ? "rx" : "err");
+      await refreshState();
+    }
+
+    refreshState();
+    setInterval(refreshState, 1500);
+  </script>
+</body>
+</html>
