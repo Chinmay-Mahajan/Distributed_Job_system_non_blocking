@@ -143,12 +143,18 @@ mkdir -p "$RESULTS_DIR"
 RAW_LOG="$RESULTS_DIR/traffic.tsv"
 touch "$RAW_LOG"
 
-# Clean up child processes on exit/interrupt
+# Clean up child and grandchild processes on exit/interrupt
 cleanup() {
     echo -e "\n${YELLOW}[!] Terminating active client jobs...${NC}"
-    kill $(jobs -p) 2>/dev/null || true
+    local pids
+    pids=$(jobs -p)
+    for pid in $pids; do
+        pkill -TERM -P "$pid" 2>/dev/null || true
+        kill -TERM "$pid" 2>/dev/null || true
+    done
     wait 2>/dev/null || true
     echo -e "${YELLOW}[!] Traffic generator stopped.${NC}"
+    exit 130
 }
 trap cleanup SIGINT SIGTERM
 
@@ -222,7 +228,12 @@ submit_and_poll_job() {
     fi
 
     # 2. Asynchronously poll via nc with secret_key until Done / Failed / TimedOut
-    while true; do
+    local poll_attempts=0
+    local max_poll_attempts=750 # ~60s hard ceiling so background subshells never loop forever
+    local empty_strikes=0
+
+    while (( poll_attempts < max_poll_attempts )); do
+        (( poll_attempts++ ))
         local poll_resp=$(send_nc "POLL ${secret_key} ${job_id}")
 
         case "$poll_resp" in
@@ -268,6 +279,7 @@ else:
                 break
                 ;;
             *Poll\ rate\ limit\ exceeded*)
+                empty_strikes=0
                 sleep 0.25
                 ;;
             -ERR*)
@@ -276,7 +288,18 @@ else:
                 fi
                 break
                 ;;
+            "")
+                (( empty_strikes++ ))
+                if (( empty_strikes >= 3 )); then
+                    if [ "$QUIET" -eq 0 ]; then
+                        echo -e "${RED}[${client_id}] Connection lost while polling #${job_num} (${job_id:0:8}). Aborting poll.${NC}"
+                    fi
+                    break
+                fi
+                sleep "$POLL_INTERVAL"
+                ;;
             *)
+                empty_strikes=0
                 sleep "$POLL_INTERVAL"
                 ;;
         esac
@@ -290,6 +313,8 @@ simulate_client() {
     local num_requests="$3"
     local submit_interval="$4"
     local complex_ratio="$5" # e.g. 50 for 50% complex
+
+    trap 'kill $(jobs -p) 2>/dev/null || true' EXIT SIGINT SIGTERM
 
     # Register client once to obtain server-issued secret_key
     local reg_resp=$(send_nc "REGISTER")

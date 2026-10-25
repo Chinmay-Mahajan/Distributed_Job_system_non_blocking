@@ -1,0 +1,44 @@
+{
+  "name": "Sandboxed Job Execution Broker (v2)",
+  "image": "mcr.microsoft.com/devcontainers/rust:1-bookworm",
+  "hostRequirements": {
+    "cpus": 4,
+    "memory": "16gb",
+    "storage": "32gb"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {
+      "moby": true,
+      "dockerDashComposeVersion": "v2"
+    },
+    "ghcr.io/devcontainers/features/python:1": {
+      "version": "3.11"
+    }
+  },
+  "forwardPorts": [7000, 8080, 6379],
+  "portsAttributes": {
+    "7000": {
+      "label": "Broker TCP Server",
+      "onAutoForward": "notify"
+    },
+    "8080": {
+      "label": "Testing Workbench GUI (app.py)",
+      "onAutoForward": "openPreview"
+    },
+    "6379": {
+      "label": "Redis L2 Auth Cache",
+      "onAutoForward": "silent"
+    }
+  },
+  "postCreateCommand": "bash .devcontainer/setup.sh",
+  "postStartCommand": "sudo service redis-server start || redis-server --daemonize yes",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "ms-azuretools.vscode-docker",
+        "ms-python.python"
+      ]
+    }
+  }
+}

@@ -131,7 +131,8 @@ impl PrewarmedContainerPool {
 
         // *pool.replenish_thread.lock().unwrap() = Some(handle);
         // pool
-
+        
+        // we have mutliple threads acting as the replenishers
         let mut handles = Vec::with_capacity(config.prewarmed_pool_size); 
         for i in 0..config.prewarmed_pool_size{
             let pool_clone = Arc::clone(&pool); 
