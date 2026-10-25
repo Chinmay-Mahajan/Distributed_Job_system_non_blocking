@@ -4,10 +4,6 @@ use std::time::Duration;
 pub enum SandboxType {
     /// Full Docker sandbox with gVisor / limits as specified in plan.md
     Docker,
-    /// Local process sandbox (useful for local development or when Docker is inactive)
-    Local, // runs code directly on my machine (with timeouts but no virtualisation.. )
-    /// Mock sandbox for deterministic testing , returns fake results for the sake of testing 
-    Mock,
 }
 
 #[derive(Debug, Clone)]
@@ -93,11 +89,8 @@ impl Config {
             config.max_in_flight_per_client = val;
         }
         if let Ok(s_type) = std::env::var("DISTJOB_SANDBOX") {
-            match s_type.to_lowercase().as_str() {
-                "local" => config.sandbox_type = SandboxType::Local,
-                "mock" => config.sandbox_type = SandboxType::Mock,
-                "docker" => config.sandbox_type = SandboxType::Docker,
-                _ => {}
+            if s_type.to_lowercase().as_str() == "docker" {
+                config.sandbox_type = SandboxType::Docker;
             }
         }
         if let Ok(Ok(val)) = std::env::var("DISTJOB_TTL_SECS").map(|t| t.parse::<u64>()) {

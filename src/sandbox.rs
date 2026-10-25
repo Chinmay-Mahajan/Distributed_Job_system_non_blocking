@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering , AtomicUsize};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -86,7 +86,8 @@ pub struct PrewarmedContainerPool {
     available: Mutex<VecDeque<String>>,
     condvar: Condvar,
     shutdown: Arc<AtomicBool>,
-    replenish_thread: Mutex<Option<thread::JoinHandle<()>>>,
+    replenish_threads:Mutex<Vec<thread::JoinHandle<()>>>,
+    spawning_count : AtomicUsize,
 }
 
 impl PrewarmedContainerPool {
@@ -116,19 +117,33 @@ impl PrewarmedContainerPool {
             available: Mutex::new(VecDeque::new()),
             condvar: Condvar::new(),
             shutdown: Arc::clone(&shutdown),
-            replenish_thread: Mutex::new(None),
+            spawning_count:AtomicUsize::new(0),
+            replenish_threads: Mutex::new(Vec::new()),
         });
 
-        let pool_clone = Arc::clone(&pool);
-        let handle = thread::Builder::new()
-            .name("distjob-warm-pool".to_string())
-            .spawn(move || {
+        // let pool_clone = Arc::clone(&pool);
+        // let handle = thread::Builder::new()
+        //     .name("distjob-warm-pool".to_string())
+        //     .spawn(move || {
+        //         pool_clone.replenish_loop();
+        //     })
+        //     .expect("Failed to spawn prewarmed pool thread");
+
+        // *pool.replenish_thread.lock().unwrap() = Some(handle);
+        // pool
+
+        let mut handles = Vec::with_capacity(config.prewarmed_pool_size); 
+        for i in 0..config.prewarmed_pool_size{
+            let pool_clone = Arc::clone(&pool); 
+            let handle = thread::Builder::new().name(format!("distjob-warm-pool-{}" , i)).spawn(move || {
                 pool_clone.replenish_loop();
             })
-            .expect("Failed to spawn prewarmed pool thread");
-
-        *pool.replenish_thread.lock().unwrap() = Some(handle);
+            .expect("failed to spawn prewarmed thread pool replenish threads");
+            handles.push(handle); 
+        }
+        *pool.replenish_threads.lock().unwrap() = handles; 
         pool
+
     }
 
     /// Claim a standby container name from the pool in O(1).
@@ -154,31 +169,38 @@ impl PrewarmedContainerPool {
 
     fn replenish_loop(&self) {
         while !self.shutdown.load(Ordering::Relaxed) {
-            let needed = {
-                let mut available = self.available.lock().unwrap();
-                while available.len() >= self.pool_size && !self.shutdown.load(Ordering::Relaxed) {
-                    available = self.condvar.wait(available).unwrap();
-                    // if the num of containers are equal to the pool size (basically no container was killed so no need to replenish the containers) 
-                    // so the thread that is running this givess up ownership of available for other threads to use the lock . 
-                }
-                if self.shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-                self.pool_size.saturating_sub(available.len())
-            };
+            {
+            let mut available = self.available.lock().unwrap();
 
-            if needed > 0 {
-                // make the needed num of containers 
-                let container_name = format!("distjob-warm-{}", &Uuid::new_v4().to_string()[..8]);
-                if self.spawn_container(&container_name) {
-                    let mut available = self.available.lock().unwrap();
-                    available.push_back(container_name);
-                } else {
-                    // Back off if daemon is down or spawn failed
-                    thread::sleep(Duration::from_secs(3));
-                }
+            while available.len() + self.spawning_count.load(Ordering::SeqCst)>= self.pool_size && !self.shutdown.load(Ordering::Relaxed) {
+                available = self.condvar.wait(available).unwrap();
+                // if the num of containers are equal to the pool size (basically no container was killed so no need to replenish the containers) 
+                // so the thread that is running this givess up ownership of available for other threads to use the lock . 
             }
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // self.pool_size.saturating_sub(available.len()); 
+            self.spawning_count.fetch_add(1, Ordering::SeqCst); 
+            
+
+          
         }
+
+
+        let container_name = format!("distjob-warm-{}" , &Uuid::new_v4().to_string()[..8]); 
+        if self.spawn_container(&container_name){
+            let mut available = self.available.lock().unwrap(); 
+            available.push_back(container_name); 
+            self.spawning_count.fetch_sub(1, Ordering::SeqCst); 
+
+        }
+        else{
+            self.spawning_count.fetch_sub(1, Ordering::SeqCst); 
+            thread::sleep(Duration::from_secs(2));
+        }
+    }
 
         // Cleanup: remove all remaining standby containers
         // happens during shutdown. 
@@ -226,9 +248,12 @@ impl PrewarmedContainerPool {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
         self.condvar.notify_all();
-        if let Some(handle) = self.replenish_thread.lock().unwrap().take() {
+        let handles : Vec<thread::JoinHandle<()>> = self.replenish_threads.lock().unwrap().drain(..).collect();  
+        for handle in handles{
             let _ = handle.join();
         }
+
+        
     }
 }
 
@@ -351,13 +376,16 @@ impl DockerSandbox {
 
         let stdout_thread = thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf); 
+            let _ = std::io::copy(&mut stdout_handle , &mut std::io::sink()); 
+            // we read from the stdout_pipe whatever bytes that remain (>MAX OUTPUT BYTES) into the std::io::sink() which is similar to /dev/null in Unix/linux 
             String::from_utf8_lossy(&buf).to_string()
         });
 
         let stderr_thread = thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = (&mut stderr_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut stderr_handle , &mut std::io::sink()); 
             String::from_utf8_lossy(&buf).to_string()
         });
 
@@ -533,12 +561,14 @@ impl DockerSandbox {
         let stdout_thread = thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut stdout_handle , &mut std::io::sink());
             String::from_utf8_lossy(&buf).to_string()
         });
 
         let stderr_thread = thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = (&mut stderr_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut stderr_handle , &mut std::io::sink());
             String::from_utf8_lossy(&buf).to_string()
         });
 
@@ -643,189 +673,3 @@ impl Sandbox for DockerSandbox {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Local Process Sandbox (Fallback / Development)
-// ---------------------------------------------------------------------------
-
-pub struct LocalProcessSandbox;
-
-impl Sandbox for LocalProcessSandbox {
-    fn execute(&self, job: &Job) -> SandboxExecutionResult {
-        let start = Instant::now();
-        let timeout = Duration::from_secs(job.timeout_secs);
-
-        let (bin, args) = match job.language.to_lowercase().as_str() {
-            "python" | "python3" | "py" => ("python3", vec!["-c".to_string(), job.code.clone()]),
-            "sh" | "bash" | "shell" => ("sh", vec!["-c".to_string(), job.code.clone()]),
-            "node" | "javascript" | "js" => ("node", vec!["-e".to_string(), job.code.clone()]),
-            _ => {
-                return SandboxExecutionResult {
-                    status: JobState::Failed,
-                    stdout: String::new(),
-                    stderr: format!("Unsupported language for local runner: '{}'", job.language),
-                    exit_code: Some(1),
-                    error_message: Some(format!("Unsupported language: '{}'", job.language)),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
-            }
-        };
-
-        let mut cmd = Command::new(bin);
-        for arg in args {
-            cmd.arg(arg);
-        }
-
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                return SandboxExecutionResult {
-                    status: JobState::Failed,
-                    stdout: String::new(),
-                    stderr: format!("Failed to spawn local process: {}", e),
-                    exit_code: Some(1),
-                    error_message: Some(format!("Process spawn error: {}", e)),
-                    duration_ms: start.elapsed().as_millis() as u64,
-                };
-            }
-        };
-
-        if let (Some(mut stdin), Some(input)) = (child.stdin.take(), &job.stdin) {
-            let _ = stdin.write_all(input.as_bytes());
-        }
-
-        let mut stdout_handle = child.stdout.take().unwrap();
-        let mut stderr_handle = child.stderr.take().unwrap();
-
-        let stdout_thread = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).to_string()
-        });
-
-        let stderr_thread = thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = (&mut stderr_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).to_string()
-        });
-
-        let mut timed_out = false;
-        let mut exit_status = None;
-
-        while start.elapsed() < timeout {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    exit_status = Some(status);
-                    break;
-                }
-                Ok(None) => {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                Err(e) => {
-                    eprintln!("Error waiting on local process: {}", e);
-                    break;
-                }
-            }
-        }
-
-        if exit_status.is_none() {
-            timed_out = true;
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        let stdout = stdout_thread.join().unwrap_or_default();
-        let mut stderr = stderr_thread.join().unwrap_or_default();
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        if timed_out {
-            stderr.push_str(&format!(
-                "\n[Broker] Execution timed out after {} seconds.",
-                job.timeout_secs
-            ));
-            SandboxExecutionResult {
-                status: JobState::TimedOut,
-                stdout,
-                stderr,
-                exit_code: None,
-                error_message: Some(format!("Job timed out after {} seconds", job.timeout_secs)),
-                duration_ms,
-            }
-        } else {
-            let code = exit_status.and_then(|s| s.code());
-            let status = match code {
-                Some(0) => JobState::Done,
-                _ => JobState::Failed,
-            };
-            SandboxExecutionResult {
-                status,
-                stdout,
-                stderr,
-                exit_code: code,
-                error_message: if status == JobState::Failed {
-                    Some(format!("Process exited with code {:?}", code))
-                } else {
-                    None
-                },
-                duration_ms,
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Mock Sandbox (For deterministic testing of worker logic, timeouts, etc.)
-// ---------------------------------------------------------------------------
-
-pub struct MockSandbox;
-
-impl Sandbox for MockSandbox {
-    fn execute(&self, job: &Job) -> SandboxExecutionResult {
-        let start = Instant::now();
-
-        // Emulate timeout if code contains "SLEEP_TIMEOUT"
-        if job.code.contains("SLEEP_TIMEOUT") {
-            thread::sleep(Duration::from_millis(
-                (job.timeout_secs * 1000).min(100),
-            ));
-            return SandboxExecutionResult {
-                status: JobState::TimedOut,
-                stdout: String::new(),
-                stderr: "Mock timeout triggered".to_string(),
-                exit_code: None,
-                error_message: Some("Job timed out".to_string()),
-                duration_ms: start.elapsed().as_millis() as u64,
-            };
-        }
-
-        // Emulate failure if code contains "FAIL"
-        if job.code.contains("FAIL") {
-            return SandboxExecutionResult {
-                status: JobState::Failed,
-                stdout: String::new(),
-                stderr: "Mock failure triggered".to_string(),
-                exit_code: Some(1),
-                error_message: Some("Mock failure".to_string()),
-                duration_ms: start.elapsed().as_millis() as u64,
-            };
-        }
-
-        // Default mock success: echo code and stdin
-        let output = format!(
-            "Executed: {} (lang: {}, stdin: {:?})",
-            job.code, job.language, job.stdin
-        );
-
-        SandboxExecutionResult {
-            status: JobState::Done,
-            stdout: output,
-            stderr: String::new(),
-            exit_code: Some(0),
-            error_message: None,
-            duration_ms: start.elapsed().as_millis() as u64,
-        }
-    }
-}

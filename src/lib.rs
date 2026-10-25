@@ -12,7 +12,7 @@ pub mod worker;
 pub use auth::{AuthManager, SharedAuthManager};
 pub use config::{Config, SandboxType};
 pub use model::{ClientCommand, Job, JobRequest, JobResult, JobState, ServerResponse};
-pub use sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox, SandboxExecutionResult};
+pub use sandbox::{DockerSandbox, Sandbox, SandboxExecutionResult};
 pub use scheduler::{SchedulerStats, TwoLevelScheduler};
 pub use server::BrokerServer;
 pub use server_async::AsyncBrokerServer;

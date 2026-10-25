@@ -22,8 +22,6 @@ fn main() -> std::io::Result<()> {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--local" => config.sandbox_type = SandboxType::Local,
-            "--mock" => config.sandbox_type = SandboxType::Mock,
             "--docker" => config.sandbox_type = SandboxType::Docker,
             "--async" => config.enable_async_server = true,
             "--sync" => config.enable_async_server = false,
@@ -80,9 +78,7 @@ fn main() -> std::io::Result<()> {
                 println!("Options:");
                 println!("  --async                  Run using Asynchronous Tokio connection model");
                 println!("  --sync                   Run using Synchronous thread-per-connection model (default)");
-                println!("  --local                  Run using Local Process sandbox");
                 println!("  --docker                 Run using Docker sandbox (default)");
-                println!("  --mock                   Run using Mock sandbox");
                 println!("  --workers, -w <N>        Number of worker threads (default: 4)");
                 println!("  --client-cap, -c <N>     Max in-flight jobs per client (default: 2)");
                 println!("  --pool-size, -p <N>      Prewarmed Docker pool size (default: 4)");

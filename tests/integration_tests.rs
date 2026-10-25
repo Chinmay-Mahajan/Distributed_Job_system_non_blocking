@@ -52,7 +52,7 @@ fn register_client_json(stream: &mut TcpStream, reader: &mut BufReader<TcpStream
 
 #[test]
 fn test_e2e_json_submit_and_poll() {
-    let (addr, _server) = start_test_server(SandboxType::Local, 2);
+    let (addr, _server) = start_test_server(SandboxType::Docker, 2);
 
     let mut stream = TcpStream::connect(&addr).expect("connect to broker");
     let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
@@ -112,7 +112,7 @@ fn test_e2e_json_submit_and_poll() {
 
 #[test]
 fn test_e2e_text_submit_and_poll() {
-    let (addr, _server) = start_test_server(SandboxType::Local, 2);
+    let (addr, _server) = start_test_server(SandboxType::Docker, 2);
 
     let mut stream = TcpStream::connect(&addr).expect("connect");
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
@@ -158,7 +158,7 @@ fn test_e2e_text_submit_and_poll() {
 
 #[test]
 fn test_e2e_wall_clock_timeout() {
-    let (addr, _server) = start_test_server(SandboxType::Local, 2);
+    let (addr, _server) = start_test_server(SandboxType::Docker, 2);
 
     let mut stream = TcpStream::connect(&addr).expect("connect");
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
@@ -201,7 +201,7 @@ fn test_e2e_wall_clock_timeout() {
 
 #[test]
 fn test_e2e_multi_client_fairness_under_contention() {
-    let (addr, _server) = start_test_server(SandboxType::Local, 2);
+    let (addr, _server) = start_test_server(SandboxType::Docker, 2);
 
     // Client A registers and submits 6 jobs that sleep for 200ms each
     let mut stream_a = TcpStream::connect(&addr).unwrap();
@@ -275,7 +275,7 @@ fn test_e2e_rate_limiting_rejection() {
         max_in_flight_per_client: 1,
         enable_queue_limit: true,
         queue_limit_multiplier: 2, // max queued = 1 * 2 = 2
-        sandbox_type: SandboxType::Local,
+        sandbox_type: SandboxType::Docker,
         default_timeout_secs: 5,
         result_ttl: Duration::from_secs(60),
         cleanup_interval: Duration::from_millis(50),
@@ -352,7 +352,7 @@ async fn test_e2e_async_server_submit_and_poll() {
         bind_address: addr.clone(),
         worker_count: 2,
         max_in_flight_per_client: 2,
-        sandbox_type: SandboxType::Local,
+        sandbox_type: SandboxType::Docker,
         default_timeout_secs: 2,
         result_ttl: Duration::from_secs(60),
         enable_async_server: true,
@@ -477,7 +477,7 @@ async fn test_e2e_async_server_submit_and_poll() {
 
 #[test]
 fn test_e2e_auth_ownership_and_unauthorized_rejection() {
-    let (addr, server) = start_test_server(SandboxType::Mock, 2);
+    let (addr, server) = start_test_server(SandboxType::Docker, 2);
 
     let mut stream = TcpStream::connect(&addr).expect("connect");
     let mut reader = BufReader::new(stream.try_clone().expect("clone"));
@@ -639,7 +639,7 @@ fn test_e2e_kick_idle_and_expired_connections() {
     let config = Config {
         bind_address: addr.clone(),
         worker_count: 1,
-        sandbox_type: SandboxType::Mock,
+        sandbox_type: SandboxType::Docker,
         l2_redis_ttl_secs: 1, // 1 second secret_key TTL
         client_idle_timeout: Duration::from_secs(5),
         ..Config::default()

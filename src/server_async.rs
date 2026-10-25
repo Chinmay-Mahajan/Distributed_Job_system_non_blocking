@@ -13,7 +13,7 @@ use crate::protocol::{
     format_error, format_poll_ok, format_pong, format_register_ok, format_stats,
     format_status_ok, format_submit_ok, parse_line, ProtocolFormat,
 };
-use crate::sandbox::{DockerSandbox, LocalProcessSandbox, MockSandbox, Sandbox};
+use crate::sandbox::{DockerSandbox, Sandbox};
 use crate::scheduler::TwoLevelScheduler;
 use crate::store::ResultStore;
 use crate::worker::WorkerPool;
@@ -41,8 +41,6 @@ impl AsyncBrokerServer {
     pub fn new(config: Config) -> Self {
         let sandbox: Arc<dyn Sandbox> = match config.sandbox_type {
             SandboxType::Docker => Arc::new(DockerSandbox::new(&config)),
-            SandboxType::Local => Arc::new(LocalProcessSandbox),
-            SandboxType::Mock => Arc::new(MockSandbox),
         };
 
         let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
