@@ -251,19 +251,17 @@ impl TwoLevelScheduler {
             .unwrap_or(true);
 
         if inner.enable_two_queue_scheduler {
-            // If the client was in the waiting queue, promote them to dispatchable!
-            if inner.waiting_queue.remove(client_id) {
-                inner.dispatchable_queue.push_back(client_id.to_string());
-                inner.in_dispatchable.insert(client_id.to_string());
+            if !is_empty{
+                if in_flight<inner.max_in_flight_per_client && inner.waiting_queue.remove(client_id){
+                    inner.dispatchable_queue.push_back(client_id.to_string()); 
+                    inner.in_dispatchable.insert(client_id.to_string()); 
+                    drop(inner); 
+                    self.condvar.notify_one();
+                }
             }
-
-            // Prune client if completely idle (no pending jobs and 0 in-flight)
-            if is_empty && in_flight == 0 {
-                inner.client_queues.remove(client_id);
-                inner.client_in_flight.remove(client_id);
-                inner.in_dispatchable.remove(client_id);
-                inner.dispatchable_queue.retain(|id| id != client_id);
-                inner.waiting_queue.remove(client_id);
+            else if in_flight==0{
+                inner.client_queues.remove(client_id); 
+                inner.client_in_flight.remove(client_id); 
             }
         } else {
             // Legacy single-queue pruning
@@ -272,11 +270,13 @@ impl TwoLevelScheduler {
                 inner.client_in_flight.remove(client_id);
                 inner.client_order.retain(|id| id != client_id);
             }
+            if !is_empty{
+                drop(inner); 
+                self.condvar.notify_one(); 
+
+            }
         }
 
-        drop(inner);
-        // Notify waiting workers that a capacity slot has opened
-        self.condvar.notify_one();
     }
 
     /// Shutdown the scheduler and wake up all waiting workers.
