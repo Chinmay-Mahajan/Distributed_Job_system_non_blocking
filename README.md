@@ -124,6 +124,8 @@ The broker supports two interchangeable connection models toggleable at startup 
 
 ## 3. Empirical Performance Benchmarks
 
+> **Note on methodology.** Sections 3.1–3.2 were produced with the original `stress_test.sh` generator, whose summary averages counted rejected submits as 0 ms waits. In 3.2, the on-demand column reuses the 3.1 heavy-preset figures (13.14 s, 4.79 req/s) while the pre-warmed column comes from the light preset (29 requests), so the two columns are not the same workload. Treat 3.1–3.2 as indicative. Sections 3.3–3.5 use the v2 load generator, which counts rejected and failed jobs separately and takes latency from server-side timestamps.
+
 ### 3.1 Multi-Tenant Fairness Under Contention (128 Burst Requests)
 Stress testing against asymmetric multi-tenant workloads (6 clients, 128 burst requests: 85 High-Freq spammers, 33 Med-Freq, 10 Low-Freq legitimate users):
 
@@ -147,6 +149,90 @@ Benchmarking the impact of the **Pre-Warmed "Bake and Burn" Container Pool** aga
 | **Completion Rate** | `100%` | **`100% (29/29)`** | **Zero Failures / Zero Drops** |
 | **Fairness Multiplier** | `1.4x` | **`4.1x lower latency`** | **Legitimate users bypass spammer backlog** |
 
+### 3.3 Reproducible Results with the v2 Load Generator
+
+These runs use [`stress_test.py`](stress_test.py), a single-process asyncio generator (one persistent TCP connection per simulated client, per-client poll pacing below the 25/s poll quota). In every run below it used 0.02–0.04 CPU cores (at most 0.4% of the machine), so it did not compete with the broker or Docker for CPU.
+
+**Metric definitions**
+* **srv p50 / p95 / p99:** job latency from server timestamps (`created_at_ms` to `completed_at_ms`), unaffected by client polling delay. Percentiles cover completed jobs only.
+* **Goodput:** completed jobs divided by wall-clock time. Rejected jobs are not counted as work done.
+* **Rejected:** submits refused by admission control. **Errors** (connection failures, poll errors, give-ups) were **0 in every run below**, and every admitted job completed.
+* **Low-Freq p50:** server-side median latency of the 10 Low-Freq jobs (small sample, indicative only).
+
+**Test environment (MacBook Air)**
+
+| Item | Value |
+| :--- | :--- |
+| Machine | MacBook Air, 10 cores given to Docker Desktop, 8 GB RAM given to Docker Desktop |
+| Sandbox | Docker with pre-warmed pool enabled |
+| Workers / pool | 64 / 64 for 3.3.1 and 3.3.2, 10 / 10 for 3.3.3 |
+| Per-client in-flight cap | Default (`2`), so 6 clients allow at most 12 jobs in flight |
+
+#### 3.3.1 Baseline Presets (default schedule, `--speed 1`, 64 workers / 64 pool)
+
+| Preset | Sent | Rejected | Done | Wall | Goodput | srv p50 | srv p95 | srv p99 | Low-Freq p50 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| light | 29 | 0 | 29 | 2.00 s | 14.48 jobs/s | 96 ms | 670 ms | 730 ms | 81 ms |
+| standard (run 1) | 69 | 0 | 69 | 4.80 s | 14.37 jobs/s | 298 ms | 1,600 ms | 2,070 ms | 119 ms |
+| standard (run 2) | 69 | 0 | 69 | 4.80 s | 14.37 jobs/s | 228 ms | 1,714 ms | 1,993 ms | 127 ms |
+| heavy (run 1) | 128 | 4 | 124 | 7.20 s | 17.21 jobs/s | 757 ms | 4,681 ms | 4,958 ms | 469 ms |
+| heavy (run 2) | 128 | 3 | 125 | 7.20 s | 17.35 jobs/s | 976 ms | 5,140 ms | 5,586 ms | 600 ms |
+| heavy (run 3) | 128 | 6 | 122 | 7.20 s | 16.94 jobs/s | 707 ms | 4,329 ms | 4,654 ms | 470 ms |
+
+At the default schedule, wall time equals the slowest client's submission schedule (2.0 s light, 4.8 s standard, 7.2 s heavy). Goodput in this table is therefore capped by the preset itself, not by broker capacity. Use `--speed` (below) to find the real ceiling.
+
+#### 3.3.2 Saturation Sweep (heavy preset, `--speed` compresses submit intervals, 64 workers / 64 pool)
+
+| `--speed` | `--warmup` | Rejected | Done | Wall | Goodput | srv p50 | srv p95 | srv p99 | Low-Freq p50 |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 10 | 0 | 34 | 94 | 5.13 s | 18.31 jobs/s | 1,981 ms | 4,234 ms | 5,039 ms | 541 ms |
+| 30 | 0 | 37 | 91 | 5.07 s | 17.94 jobs/s | 2,063 ms | 4,455 ms | 4,845 ms | 285 ms |
+| 50 | 0 | 37 | 91 | 5.01 s | 18.16 jobs/s | 1,996 ms | 4,431 ms | 4,885 ms | 214 ms |
+| 100 | 0 | 37 | 91 | 5.32 s | 17.12 jobs/s | 2,360 ms | 5,020 ms | 5,164 ms | 370 ms |
+| 30 | 10 | 37 | 91 | 4.86 s | 18.74 jobs/s | 1,933 ms | 4,532 ms | 4,635 ms | 286 ms |
+| 50 | 10 | 37 | 91 | 4.91 s | 18.53 jobs/s | 2,021 ms | 4,622 ms | 4,746 ms | 264 ms |
+
+Observations:
+* **Saturation:** goodput stays at roughly 17–19 jobs/s from `--speed 10` through `--speed 100`, and p95 latency stays within about 4.2–5.0 s. Beyond saturation, extra offered load is shed by admission control (rejections plateau at 37 of the 85 High-Freq submits) instead of growing latency.
+* **Where rejections land:** all rejections were High-Freq submits. Med-Freq (33/33) and Low-Freq (10/10) jobs were all admitted and completed in every saturated run.
+* **Fairness signal:** Low-Freq p50 was 214–541 ms against 1,933–2,360 ms overall.
+* **Warm-up:** `--warmup 10` changed goodput by +2% to +4%, which is within the spread seen between repeated runs, so no conclusion is drawn from it.
+
+#### 3.3.3 Worker Count: 64 / 64 vs 10 / 10 (heavy preset, `--warmup 10`)
+
+| Config | Flags | Rejected | Done | Wall | Goodput | srv p50 | srv p95 | srv p99 | Low-Freq p50 |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 64 / 64 | `--speed 50` | 37 | 91 | 4.91 s | 18.53 jobs/s | 2,021 ms | 4,622 ms | 4,746 ms | 264 ms |
+| 10 / 10 | `--speed 50` | 39 | 89 | 4.23 s | 21.04 jobs/s | 2,034 ms | 3,774 ms | 4,120 ms | 724 ms |
+| 10 / 10 | `--speed 100` | 40 | 88 | 4.20 s | 20.96 jobs/s | 1,994 ms | 3,892 ms | 4,004 ms | 966 ms |
+| 10 / 10 | light, `--speed 100` | 0 | 29 | 1.42 s | 20.41 jobs/s | 699 ms | 1,309 ms | 1,340 ms | 118 ms |
+
+Observations:
+* Dropping from 64 to 10 workers raised goodput by about 13% and lowered p95 by about 18%. With the default per-client cap, at most 12 jobs can be in flight in this preset, so workers beyond that sit idle, while a 64-container pool consumes RAM and refill CPU.
+* The tradeoff is Low-Freq p50 latency: 724–966 ms at 10 workers against 214–370 ms at 64. With every worker busy, a small tenant's job can wait for a free worker, whereas 64 workers always leave one free. This is an untested explanation, and each figure is a single run.
+
+### 3.4 Cross-Environment Comparison (heavy preset)
+
+| Environment | Cores | Workers / pool | Load generator | Peak heavy goodput |
+| :--- | :---: | :---: | :--- | :---: |
+| MacBook Air + Docker Desktop | 10 | 64 / 64 | bash (`stress_test.sh`) | 17.9 jobs/s |
+| MacBook Air + Docker Desktop | 10 | 64 / 64 | v2 async (`--speed` sweep) | 18.7 jobs/s |
+| MacBook Air + Docker Desktop | 10 | 10 / 10 | v2 async | 21.0 jobs/s |
+| GitHub Codespaces | 4 | 4 / 4 | bash (`stress_test.sh`) | 6.79 jobs/s |
+| GitHub Codespaces | 4 | 4 / 4 | v2 async (`--speed` sweep) | 6.86 jobs/s |
+
+Observations:
+* **The generator was not the bottleneck.** Replacing the process-spawning bash generator with the v2 generator changed Codespaces from 6.79 to 6.86 jobs/s, so the gap to the MacBook is not explained by generator CPU.
+* **This is not a like-for-like hardware comparison.** The machines ran different worker counts (4 versus 10 to 64) as well as different core counts, so the roughly 3x throughput difference mixes concurrency and hardware.
+* **Time per worker slot (assuming workers are the binding limit):** 10 workers / 21 jobs/s is about 0.48 s of worker time per job on the MacBook, and 4 workers / 6.86 jobs/s is about 0.58 s on Codespaces. Part of each figure is the sleep-based jobs in the test mix (roughly 0.08 s on average); the rest is container and interpreter start-up cost.
+
+### 3.5 How to Read These Numbers
+
+* **Single runs.** Most rows are one run. Observed spread was about ±1% between repeated heavy baseline runs (16.94–17.35 jobs/s) and about ±4% between saturated 64 / 64 runs (17.12–18.74 jobs/s). Differences smaller than about 5% should be treated as noise.
+* **Goodput at the default schedule is preset-bound** (see 3.3.1). Only the `--speed` runs approach the system's capacity.
+* **Local hardware.** Results were measured on a laptop (shared CPU, thermal limits, Docker Desktop VM) and a shared cloud VM, not dedicated servers. Treat them as directional.
+* **Not yet measured:** a matched worker-count matrix (for example 4, 8 and 12 workers on both machines), CPU utilisation during runs, the warm-pool hit ratio, and an nsjail or microVM backend on native Linux.
+
 ---
 
 ## 4. Current Architectural Gaps & Known Limitations
@@ -162,6 +248,7 @@ While the broker core, authentication layer, and execution engine are robust and
    * While authentication keys and penalty states are backed by Redis (L2), the active scheduler queues and [`ResultStore`](src/store.rs) entries reside in the memory of a single broker process. If the broker restarts, pending jobs and uncollected results are lost.
 4. **Container Startup Latency (Mitigated by Pre-Warmed Pool):**
    * *Status:* Container initialization overhead is now mitigated by the asynchronous [`PrewarmedContainerPool`](src/sandbox.rs), dropping warm execution startup to sub-20ms. Under sustained bursts that temporarily exhaust the pool, the broker gracefully falls back to on-demand `docker run` (~300ms–800ms). MicroVMs (e.g., AWS Firecracker) represent the subsequent optimization frontier.
+   * *Measured ceiling:* Under saturation (section 3.3), throughput topped out at about 21 jobs/s on a 10-core MacBook with Docker Desktop and about 7 jobs/s on a 4-vCPU Codespace, which works out to roughly 0.5 s of worker time per job. Per-job container and interpreter cost, not the scheduler, is the limiting factor.
 
 ---
 
@@ -363,6 +450,32 @@ python3 stress_test.py --preset light
 # High-concurrency heavy stress test (6 clients, 128 burst requests)
 ./stress_test.sh --preset heavy
 ```
+
+The Python generator (`stress_test.py`) is the recommended way to benchmark. It runs as a single process with one persistent connection per client, reports rejected and failed jobs separately, prints its own CPU usage, and takes latency from server timestamps. The bash generator (`stress_test.sh`) starts several processes per poll, so on small machines it can use a noticeable share of the CPU it is measuring. Use it for quick smoke tests only.
+
+```bash
+# Default schedule (goodput is capped by the preset's submission schedule)
+python3 stress_test.py --preset heavy
+
+# Saturation test: compress submit intervals 50x, warm the pool first, save raw results
+python3 stress_test.py --preset heavy --speed 50 --warmup 10 --json run1.json
+
+# Run the generator from a different machine than the broker
+python3 stress_test.py --host <broker-ip> --port 7000 --preset heavy --speed 50
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host` / `--port` | `127.0.0.1` / `7000` | Broker address |
+| `--preset` | `standard` | `light` (alias `quick`), `standard`, or `heavy` |
+| `--speed` | `1.0` | Divides submit intervals, so `50` offers 50x the load rate |
+| `--warmup` | `8` | Throwaway jobs run before measuring to fill the warm pool (`0` disables) |
+| `--poll-interval` | `0.1` | Seconds between polls for each job |
+| `--max-poll-rate` | `20` | Per-client polls/sec cap, keep below `DISTJOB_MAX_POLLS_PER_SEC` |
+| `--job-deadline` | `120` | Give up on a job after this many seconds |
+| `--json` | (none) | Write raw per-job records and the summary to a file |
+
+For comparisons between configurations or machines, use the same preset, `--speed`, and commit, record `--workers` and `--pool-size`, and repeat each run at least three times.
 
 ### 8.6 Local Testing Workbench GUI (`testing_gui/`)
 ```bash

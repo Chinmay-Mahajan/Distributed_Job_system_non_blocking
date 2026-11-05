@@ -1,423 +1,252 @@
 #!/usr/bin/env python3
 """
-Multi-Tenant Traffic Simulator & Stress Testing Suite for Sandboxed Job Execution Broker (v2).
+Single-process asyncio load generator for the job broker (text protocol).
 
-Compatible with the Two-Tier L1 (Heap) + L2 (Redis) Authentication & Poll Rate-Limiting architecture:
-  1. Each simulated tenant registers via 'REGISTER' to obtain a unique server-issued secret_key.
-  2. All SUBMIT and POLL commands authenticate using that tenant's secret_key.
-  3. Respects per-user polling rate limits (backing off automatically if a burst triggers a poll strike).
+Why this exists: the bash generator forks nc/head/tr/perl/python3 for every
+poll, which burns CPU on the same cores as the broker and Docker. This version
+uses ONE process and ONE persistent TCP connection per simulated client, and
+reports how much CPU the generator itself used so you can verify it is not
+distorting the result.
+
+Usage:
+  python3 stress_async.py --host 127.0.0.1 --port 7000 --preset heavy
+  python3 stress_async.py --preset heavy --json run1.json   # for repeat runs
 """
-
 import argparse
+import asyncio
 import json
-import socket
+import math
+import os
+import random
 import statistics
-import sys
-import threading
 import time
-from typing import Dict, List
 
-WORKLOAD_POOL = {
-    "simple": [
-        ("Simple-Math", "python", "print(sum(range(500)))"),
-        ("Simple-String", "python", "print('stress_traffic_sim'[::-1]*2)"),
-        ("Simple-Echo", "sh", "echo 'sh_worker_ok'"),
-        ("Simple-Sqrt", "python", "import math; print(math.isqrt(9876543210))"),
-        ("Simple-Dict", "python", "print({i: i**2 for i in range(20)})"),
+# (client_id, tier, num_requests, submit_interval_s, complex_percent)
+PRESETS = {
+    "light": [
+        ("client_spammer_1", "High-Freq", 12, 0.06, 40),
+        ("client_spammer_2", "High-Freq", 10, 0.08, 50),
+        ("client_moderate_1", "Med-Freq", 5, 0.35, 40),
+        ("client_slow_1", "Low-Freq", 2, 1.00, 50),
     ],
-    "complex": [
-        ("Complex-Fib", "python", "a,b=0,1; exec('for _ in range(3000): a,b=b,a+b'); print('fib_len:', len(str(b)))"),
-        ("Complex-Primes", "python", "p=[x for x in range(2, 5000) if all(x%d!=0 for d in range(2, int(x**0.5)+1))]; print('primes:', len(p))"),
-        ("Complex-Delay300", "python", "import time; time.sleep(0.3); sum(i*i for i in range(100000)); print('delay_300ms_ok')"),
-        ("Complex-Delay600", "python", "import time; time.sleep(0.6); print('delay_600ms_ok')"),
-        ("Complex-Matrix", "python", "a=[[1,2,3],[4,5,6],[7,8,9]]; print(sum(sum(r) for r in a)*1000)"),
+    "standard": [
+        ("client_spammer_1", "High-Freq", 24, 0.04, 50),
+        ("client_spammer_2", "High-Freq", 20, 0.07, 50),
+        ("client_moderate_1", "Med-Freq", 10, 0.30, 40),
+        ("client_moderate_2", "Med-Freq", 8, 0.40, 40),
+        ("client_slow_1", "Low-Freq", 4, 1.20, 50),
+        ("client_slow_2", "Low-Freq", 3, 1.50, 50),
+    ],
+    "heavy": [
+        ("client_spammer_1", "High-Freq", 45, 0.03, 50),
+        ("client_spammer_2", "High-Freq", 40, 0.05, 50),
+        ("client_moderate_1", "Med-Freq", 18, 0.25, 40),
+        ("client_moderate_2", "Med-Freq", 15, 0.35, 40),
+        ("client_slow_1", "Low-Freq", 6, 1.20, 50),
+        ("client_slow_2", "Low-Freq", 4, 1.60, 50),
     ],
 }
+PRESETS["quick"] = PRESETS["light"]
+
+SIMPLE = [
+    ("Simple-Math", "python", "print(sum(range(500)))"),
+    ("Simple-String", "python", "print('stress_test_traffic'[::-1]*2)"),
+    ("Simple-Echo", "sh", "echo worker_job_done"),
+    ("Simple-Sqrt", "python", "import math; print(math.isqrt(9876543210))"),
+]
+COMPLEX = [
+    ("Complex-Fib", "python", "a,b=0,1; exec('for _ in range(3000): a,b=b,a+b'); print('fib_len:', len(str(b)))"),
+    ("Complex-Primes", "python", "p=[x for x in range(2, 5000) if all(x%d!=0 for d in range(2, int(x**0.5)+1))]; print('primes:', len(p))"),
+    ("Complex-Delay300", "python", "import time; time.sleep(0.3); sum(i*i for i in range(100000)); print('delay_300ms_ok')"),
+    ("Complex-Delay600", "python", "import time; time.sleep(0.6); print('delay_600ms_ok')"),
+    ("Complex-Matrix", "python", "a=[[1,2,3],[4,5,6],[7,8,9]]; print(sum(sum(r) for r in a)*1000)"),
+]
+TERMINAL = ("+Done", "+Failed", "+TimedOut")
 
 
-class NcClient:
-    """Communicates with the broker using line-oriented text protocol commands."""
+def pick(i, complex_pct):
+    use_complex = complex_pct > 0 and (i * 17) % 100 < complex_pct
+    pool = COMPLEX if use_complex else SIMPLE
+    return pool[i % len(pool)]
 
-    def __init__(self, host: str, port: int, timeout: int = 5):
-        self.host = host
-        self.port = int(port)
-        self.timeout = timeout
 
-    def send_command(self, cmd: str) -> str:
-        """Sends a text protocol command and returns the single-line response immediately."""
+def pct(xs, p):
+    if not xs:
+        return float("nan")
+    xs = sorted(xs)
+    return xs[max(0, math.ceil(p * len(xs)) - 1)]
+
+
+class Client:
+    def __init__(self, spec, args, sink):
+        self.name, self.tier, self.n, self.interval, self.cplx = spec
+        self.interval = self.interval / args.speed
+        self.args = args
+        self.sink = sink
+        self.io = asyncio.Lock()          # one request/response at a time per connection
+        self.pace_lock = asyncio.Lock()   # keeps this client's polls under the broker quota
+        self.next_poll = 0.0
+        self.min_gap = 1.0 / args.max_poll_rate
+
+    async def connect(self):
+        self.r, self.w = await asyncio.open_connection(self.args.host, self.args.port)
+        resp = await self.rpc("REGISTER")
+        if not resp.startswith("+sk_"):
+            raise RuntimeError(f"[{self.name}] REGISTER failed: {resp}")
+        self.key = resp[1:]
+
+    async def rpc(self, line):
+        async with self.io:
+            self.w.write((line + "\n").encode())
+            await self.w.drain()
+            data = await asyncio.wait_for(self.r.readline(), 30)
+        if not data:
+            raise ConnectionError("broker closed the connection")
+        return data.decode().strip()
+
+    async def pace(self):
+        async with self.pace_lock:
+            now = time.monotonic()
+            if self.next_poll > now:
+                await asyncio.sleep(self.next_poll - now)
+                now = time.monotonic()
+            self.next_poll = max(now, self.next_poll) + self.min_gap
+
+    async def job(self, i):
+        jtype, lang, code = pick(i, self.cplx)
+        rec = dict(client=self.name, tier=self.tier, type=jtype, outcome="Unknown",
+                   client_ms=None, server_ms=None, exec_ms=None, queue_ms=None, throttled=0)
+        t0 = time.monotonic()
         try:
-            with socket.create_connection((self.host, self.port), timeout=self.timeout) as s:
-                s.sendall((cmd + "\n").encode("utf-8"))
-                with s.makefile("r", encoding="utf-8") as reader:
-                    return reader.readline().strip()
-        except Exception as e:
-            return f"-ERR {e}"
+            resp = await self.rpc(f"SUBMIT {self.key} {lang} {code}")
+            if not resp.startswith(":"):
+                low = resp.lower()
+                rec["outcome"] = "Rejected" if ("rate limit" in low or "queue" in low) else "SubmitError"
+                rec["detail"] = resp[:120]
+                return
+            job_id = resp[1:]
+            while True:
+                if time.monotonic() - t0 > self.args.job_deadline:
+                    rec["outcome"] = "GaveUp"
+                    return
+                await self.pace()
+                resp = await self.rpc(f"POLL {self.key} {job_id}")
+                head = resp.split(" ", 1)[0]
+                if head in TERMINAL:
+                    rec["client_ms"] = (time.monotonic() - t0) * 1000
+                    rec["outcome"] = head[1:]
+                    if " " in resp:
+                        try:
+                            d = json.loads(resp.split(" ", 1)[1])
+                            c, f = d.get("created_at_ms"), d.get("completed_at_ms")
+                            ex = d.get("execution_duration_ms") or 0
+                            if c and f:
+                                rec["server_ms"] = f - c
+                                rec["exec_ms"] = ex
+                                rec["queue_ms"] = max(0, (f - c) - ex)
+                        except ValueError:
+                            pass
+                    return
+                if "poll rate limit" in resp.lower():
+                    rec["throttled"] += 1
+                    await asyncio.sleep(0.25)
+                    continue
+                if resp.startswith("-ERR"):
+                    rec["outcome"] = "PollError"
+                    rec["detail"] = resp[:120]
+                    return
+                await asyncio.sleep(self.args.poll_interval * random.uniform(0.8, 1.2))
+        except Exception as e:  # connection problems etc. are counted, not hidden
+            rec["outcome"] = "Error"
+            rec["detail"] = repr(e)[:120]
+        finally:
+            self.sink.append(rec)
 
-    def register_key(self) -> str:
-        """Registers a new client with the broker and returns its server-issued secret_key."""
-        resp = self.send_command("REGISTER")
-        if resp.startswith("+"):
-            return resp[1:].strip()
-        if '"secret_key"' in resp:
-            try:
-                return json.loads(resp).get("secret_key", "")
-            except Exception:
-                pass
-        raise RuntimeError(f"Failed to REGISTER secret_key from broker: {resp}")
-
-
-class JobRecord:
-    def __init__(
-        self,
-        client_id: str,
-        tier: str,
-        job_num: int,
-        job_type: str,
-        submit_time_ms: int,
-        done_time_ms: int,
-        status: str,
-        exec_duration_ms: int,
-        queue_wait_ms: int,
-    ):
-        self.client_id = client_id
-        self.tier = tier
-        self.job_num = job_num
-        self.job_type = job_type
-        self.submit_time_ms = submit_time_ms
-        self.done_time_ms = done_time_ms
-        self.wait_time_ms = max(0, done_time_ms - submit_time_ms)
-        self.status = status
-        self.exec_duration_ms = exec_duration_ms
-        self.queue_wait_ms = queue_wait_ms
-
-
-def run_client_worker(
-    client_label: str,
-    tier: str,
-    num_requests: int,
-    submit_interval: float,
-    complex_ratio: int,
-    nc: NcClient,
-    poll_interval: float,
-    records_lock: threading.Lock,
-    records_list: List[JobRecord],
-    verbose: bool,
-):
-    """Simulates a single authenticated tenant issuing requests at specified frequency intervals."""
-    try:
-        secret_key = nc.register_key()
-    except Exception as e:
-        print(f"[{client_label}] REGISTER ERROR: {e}")
-        return
-
-    if verbose:
-        print(f"[{client_label}] Registered -> {secret_key[:14]}...")
-
-    threads: List[threading.Thread] = []
-
-    def submit_and_poll(job_num: int, jtype: str, jlang: str, jcode: str):
-        t0 = int(time.time() * 1000)
-
-        # 1. Authenticated SUBMIT
-        cmd = f"SUBMIT {secret_key} {jlang} {jcode}"
-        submit_resp = nc.send_command(cmd)
-
-        job_id = None
-        if submit_resp.startswith(":"):
-            job_id = submit_resp[1:].strip()
-        elif '"job_id"' in submit_resp:
-            try:
-                job_id = json.loads(submit_resp).get("job_id")
-            except Exception:
-                pass
-
-        if not job_id:
-            if verbose:
-                print(f"[{client_label}] SUBMIT REJECTED #{job_num}: {submit_resp}")
-            return
-
-        if verbose:
-            print(f"[{client_label}] SUBMIT #{job_num:02d} [{jtype}] -> {job_id[:8]}...")
-
-        # 2. Authenticated POLL until terminal state
-        while True:
-            poll_resp = nc.send_command(f"POLL {secret_key} {job_id}")
-            if any(poll_resp.startswith(prefix) for prefix in ("+Done", "+Failed", "+TimedOut")):
-                t1 = int(time.time() * 1000)
-                status = "Unknown"
-                exec_dur = 0
-                queue_wait = 0
-
-                idx = poll_resp.find("{")
-                if idx != -1:
-                    try:
-                        data = json.loads(poll_resp[idx:])
-                        status = data.get("status", "Unknown")
-                        exec_dur = data.get("execution_duration_ms") or 0
-                        c_at = data.get("created_at_ms") or 0
-                        d_at = data.get("completed_at_ms") or 0
-                        if c_at and d_at:
-                            queue_wait = max(0, (d_at - c_at) - exec_dur)
-                    except Exception:
-                        pass
-
-                rec = JobRecord(
-                    client_id=client_label,
-                    tier=tier,
-                    job_num=job_num,
-                    job_type=jtype,
-                    submit_time_ms=t0,
-                    done_time_ms=t1,
-                    status=status,
-                    exec_duration_ms=exec_dur,
-                    queue_wait_ms=queue_wait,
-                )
-
-                with records_lock:
-                    records_list.append(rec)
-
-                if verbose:
-                    print(
-                        f"[{client_label}] DONE   #{job_num:02d} [{jtype}] | "
-                        f"Wait: {rec.wait_time_ms:4d}ms | Exec: {exec_dur:4d}ms | Queue: {queue_wait:4d}ms | {status}"
-                    )
-                break
-            elif "Poll rate limit exceeded" in poll_resp:
-                # Back off for 250ms if concurrent polls for this tenant hit the per-sec poll quota
-                time.sleep(0.25)
-            elif poll_resp.startswith("-ERR"):
-                if verbose:
-                    print(f"[{client_label}] POLL ERR #{job_num}: {poll_resp}")
-                break
-            else:
-                time.sleep(poll_interval)
-
-    # Dispatch loop
-    for i in range(1, num_requests + 1):
-        is_complex = (i * 17) % 100 < complex_ratio
-        category = "complex" if is_complex else "simple"
-        options = WORKLOAD_POOL[category]
-        jtype, jlang, jcode = options[(i - 1) % len(options)]
-
-        t = threading.Thread(target=submit_and_poll, args=(i, jtype, jlang, jcode))
-        t.start()
-        threads.append(t)
-
-        time.sleep(submit_interval)
-
-    for t in threads:
-        t.join()
+    async def run(self):
+        tasks = []
+        for i in range(1, self.n + 1):
+            tasks.append(asyncio.create_task(self.job(i)))
+            await asyncio.sleep(self.interval)
+        await asyncio.gather(*tasks)
 
 
-def print_report(records: List[JobRecord], elapsed_sec: float, pre_stats: str, post_stats: str):
-    """Outputs a comprehensive analytics report."""
-    if not records:
-        print("No job records collected.")
-        return
+def report(records, wall, cpu, args):
+    tiers = ["High-Freq", "Med-Freq", "Low-Freq"]
+    print("=" * 112)
+    print(f"{'Tier':<10} {'Sent':>5} {'Rej':>5} {'Err':>5} {'Done':>5} | "
+          f"{'srv p50':>8} {'srv p95':>8} {'srv p99':>8} | {'cli p50':>8} {'cli p95':>8} | {'queue avg':>9} {'throttled':>9}")
+    print("-" * 112)
+    out = {}
+    for tier in tiers + ["ALL"]:
+        rs = records if tier == "ALL" else [r for r in records if r["tier"] == tier]
+        if not rs:
+            continue
+        done = [r for r in rs if r["outcome"] in ("Done", "Failed", "TimedOut")]
+        rej = sum(r["outcome"] == "Rejected" for r in rs)
+        err = len(rs) - len(done) - rej
+        srv = [r["server_ms"] for r in done if r["server_ms"] is not None]
+        cli = [r["client_ms"] for r in done if r["client_ms"] is not None]
+        q = [r["queue_ms"] for r in done if r["queue_ms"] is not None]
+        thr = sum(r["throttled"] for r in rs)
+        print(f"{tier:<10} {len(rs):>5} {rej:>5} {err:>5} {len(done):>5} | "
+              f"{pct(srv, .5):>8.0f} {pct(srv, .95):>8.0f} {pct(srv, .99):>8.0f} | "
+              f"{pct(cli, .5):>8.0f} {pct(cli, .95):>8.0f} | "
+              f"{(statistics.mean(q) if q else float('nan')):>9.0f} {thr:>9}")
+        out[tier] = dict(sent=len(rs), rejected=rej, errors=err, done=len(done),
+                         srv_p50=pct(srv, .5), srv_p95=pct(srv, .95), srv_p99=pct(srv, .99),
+                         cli_p50=pct(cli, .5), cli_p95=pct(cli, .95), throttled=thr)
+    print("-" * 112)
+    done_all = out["ALL"]["done"]
+    cores = os.cpu_count() or 1
+    gen_cores = cpu / wall if wall else 0
+    print(f"Wall time:            {wall:.2f}s")
+    print(f"Goodput (completed):  {done_all / wall:.2f} jobs/s   (rejected jobs are NOT counted as work done)")
+    print(f"Rejected / Errors:    {out['ALL']['rejected']} / {out['ALL']['errors']} of {out['ALL']['sent']} sent")
+    print(f"Generator CPU:        {cpu:.2f}s = {gen_cores:.2f} cores avg ({100 * gen_cores / cores:.1f}% of this machine)")
+    if gen_cores / cores > 0.10:
+        print("  WARNING: generator used >10% of the machine; move it off the broker's host.")
+    print("srv = server timestamps (created->completed), unaffected by client polling.")
+    print("cli = client-observed (includes polling delay). Latency stats cover completed jobs only.")
+    out["_meta"] = dict(preset=args.preset, wall_s=wall, goodput=done_all / wall,
+                        generator_cores=gen_cores, machine_cores=cores)
+    return out
 
-    # Group by client
-    clients: Dict[str, Dict] = {}
-    for r in records:
-        if r.client_id not in clients:
-            clients[r.client_id] = {"tier": r.tier, "records": []}
-        clients[r.client_id]["records"].append(r)
 
-    print("\n" + "=" * 110)
-    print("                        CLIENT WAIT TIME & LATENCY PERFORMANCE REPORT")
-    print("=" * 110)
-    print(
-        f"{'Client Label':<18} {'Tier':<10} {'Reqs':<5} {'Done':<5} {'Avg Wait':<11} {'Min':<8} {'P50':<8} "
-        f"{'P95':<8} {'Max':<8} {'Avg Exec':<11} {'Avg Queue':<11}"
-    )
-    print("-" * 110)
+async def main_async(args):
+    sink = []
+    if args.warmup > 0:  # fill the warm pool / caches, then discard
+        warm_sink = []
+        wc = Client(("warmup", "Warmup", args.warmup, 0.05, 0), args, warm_sink)
+        await wc.connect()
+        await wc.run()
+        await asyncio.sleep(1.0)
 
-    tier_order = {"High-Freq": 1, "Med-Freq": 2, "Low-Freq": 3}
-    sorted_clients = sorted(clients.items(), key=lambda x: (tier_order.get(x[1]["tier"], 9), x[0]))
-
-    for cid, data in sorted_clients:
-        recs = data["records"]
-        tier = data["tier"]
-        total_reqs = len(recs)
-        waits = [r.wait_time_ms for r in recs]
-        execs = [r.exec_duration_ms for r in recs]
-        queues = [r.queue_wait_ms for r in recs]
-
-        avg_w = statistics.mean(waits)
-        min_w = min(waits)
-        max_w = max(waits)
-        p50_w = statistics.median(waits)
-        p95_w = sorted(waits)[int(len(waits) * 0.95)] if len(waits) > 1 else max_w
-        avg_e = statistics.mean(execs)
-        avg_q = statistics.mean(queues)
-
-        print(
-            f"{cid:<18} {tier:<10} {total_reqs:<5} {len(recs):<5} {avg_w:>7.1f} ms {min_w:>6}ms "
-            f"{p50_w:>6.0f}ms {p95_w:>6.0f}ms {max_w:>6}ms {avg_e:>7.1f} ms {avg_q:>7.1f} ms"
-        )
-
-    print("-" * 110)
-
-    # Complexity Breakdown
-    simple_recs = [r for r in records if r.job_type.startswith("Simple")]
-    complex_recs = [r for r in records if r.job_type.startswith("Complex")]
-
-    print("\n" + "=" * 80)
-    print("                          WORKLOAD COMPLEXITY BREAKDOWN")
-    print("=" * 80)
-    print(f"{'Complexity':<15} {'Count':<8} {'Avg Wait Time':<18} {'Avg Sandbox Exec':<18} {'Avg Queue Wait':<15}")
-    print("-" * 80)
-
-    for name, rlist in [("Simple (Short)", simple_recs), ("Complex (Heavy)", complex_recs)]:
-        if rlist:
-            w_avg = statistics.mean([r.wait_time_ms for r in rlist])
-            e_avg = statistics.mean([r.exec_duration_ms for r in rlist])
-            q_avg = statistics.mean([r.queue_wait_ms for r in rlist])
-            print(f"{name:<15} {len(rlist):<8} {w_avg:>13.1f} ms {e_avg:>15.1f} ms {q_avg:>13.1f} ms")
-        else:
-            print(f"{name:<15} {0:<8} {'N/A':<18} {'N/A':<18} {'N/A':<15}")
-
-    print("-" * 80)
-
-    # System-wide Totals
-    total_jobs = len(records)
-    overall_avg_wait = statistics.mean([r.wait_time_ms for r in records])
-    throughput = total_jobs / elapsed_sec if elapsed_sec > 0 else 0
-
-    high_tier_waits = [r.wait_time_ms for r in records if r.tier == "High-Freq"]
-    low_tier_waits = [r.wait_time_ms for r in records if r.tier == "Low-Freq"]
-    avg_high = statistics.mean(high_tier_waits) if high_tier_waits else 0
-    avg_low = statistics.mean(low_tier_waits) if low_tier_waits else 0
-
-    print("\n" + "=" * 80)
-    print("                        SYSTEM STRESS TEST SUMMARY")
-    print("=" * 80)
-    print(f"Total Requests Processed:     {total_jobs}")
-    print(f"Total Test Duration:          {elapsed_sec:.2f} seconds")
-    print(f"Overall System Throughput:    {throughput:.2f} requests/sec")
-    print(f"System-Wide Average Wait:     {overall_avg_wait:.1f} ms")
-    print(f"High-Frequency Avg Wait:      {avg_high:.1f} ms")
-    print(f"Low-Frequency Avg Wait:       {avg_low:.1f} ms")
-    print("-" * 80)
-
-    print("\n--- ARCHITECTURAL VERIFICATION & FAIRNESS ANALYSIS ---")
-    if avg_low < avg_high:
-        ratio = avg_high / avg_low if avg_low > 0 else 1.0
-        print(f"[FAIRNESS CONFIRMED] Low-frequency clients experienced {ratio:.1f}x lower average wait time")
-        print("                     than high-frequency spamming clients.")
-        print("  -> Why? The Two-Level Scheduler successfully enforced the per-client in-flight cap")
-        print("     (max_in_flight_per_client) keyed by SHA-256(secret_key), preventing heavy clients")
-        print("     from monopolizing worker threads and servicing low-frequency clients without starvation.")
-    else:
-        print("[FAIRNESS OBSERVATION] Workloads completed with low queue contention across all tiers.")
-    print("=" * 80)
+    clients = [Client(s, args, sink) for s in PRESETS[args.preset]]
+    await asyncio.gather(*(c.connect() for c in clients))
+    cpu0, t0 = time.process_time(), time.monotonic()
+    await asyncio.gather(*(c.run() for c in clients))
+    wall, cpu = time.monotonic() - t0, time.process_time() - cpu0
+    summary = report(sink, wall, cpu, args)
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(dict(summary=summary, records=sink), f, indent=1)
+        print(f"Saved {args.json}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simulate traffic and stress test the Distributed Job Execution Broker.")
-    parser.add_argument("--host", default="127.0.0.1", help="Broker server host (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=7000, help="Broker server port (default: 7000)")
-    parser.add_argument(
-        "--preset",
-        choices=["quick", "light", "standard", "heavy"],
-        default="standard",
-        help="Predefined traffic profile (default: standard)",
-    )
-    parser.add_argument(
-        "--poll-interval",
-        type=float,
-        default=0.08,
-        help="Polling delay in seconds (default: 0.08)",
-    )
-    parser.add_argument(
-        "--quiet",
-        action="store_true",
-        help="Suppress live per-job progress output",
-    )
-    args = parser.parse_args()
-
-    nc = NcClient(args.host, args.port)
-
-    # Health check
-    print(f"Connecting to broker at {args.host}:{args.port}...")
-    ping_resp = nc.send_command("PING")
-    if "+PONG" not in ping_resp:
-        print(f"Error: Broker server at {args.host}:{args.port} not responding (Response: '{ping_resp}').")
-        print("Start the broker in another terminal:")
-        print(f"  cargo run -- --async --local {args.host}:{args.port}")
-        sys.exit(1)
-
-    print("✓ Broker is alive!")
-    pre_stats = nc.send_command("STATS")
-    print(f"Initial Broker Stats: {pre_stats}\n")
-
-    # Define Client Profiles based on Preset
-    profiles = {
-        "quick": [
-            ("client_spammer_1", "High-Freq", 12, 0.06, 40),
-            ("client_spammer_2", "High-Freq", 10, 0.08, 50),
-            ("client_moderate_1", "Med-Freq", 5, 0.35, 40),
-            ("client_slow_1", "Low-Freq", 2, 1.00, 50),
-        ],
-        "standard": [
-            ("client_spammer_1", "High-Freq", 24, 0.04, 50),
-            ("client_spammer_2", "High-Freq", 20, 0.07, 50),
-            ("client_moderate_1", "Med-Freq", 10, 0.30, 40),
-            ("client_moderate_2", "Med-Freq", 8, 0.40, 40),
-            ("client_slow_1", "Low-Freq", 4, 1.20, 50),
-            ("client_slow_2", "Low-Freq", 3, 1.50, 50),
-        ],
-        "heavy": [
-            ("client_spammer_1", "High-Freq", 45, 0.03, 50),
-            ("client_spammer_2", "High-Freq", 40, 0.05, 50),
-            ("client_moderate_1", "Med-Freq", 18, 0.25, 40),
-            ("client_moderate_2", "Med-Freq", 15, 0.35, 40),
-            ("client_slow_1", "Low-Freq", 6, 1.20, 50),
-            ("client_slow_2", "Low-Freq", 4, 1.60, 50),
-        ],
-    }
-    profiles["light"] = profiles["quick"]
-
-    client_configs = profiles[args.preset]
-    print(f"Running Traffic Simulation Preset '{args.preset}' with {len(client_configs)} clients:")
-    for cid, tier, reqs, interval, comp in client_configs:
-        print(f"  - {cid:<18} [{tier:<9}] -> {reqs:2d} requests, interval {interval:5.2f}s, {comp}% complex")
-
-    records: List[JobRecord] = []
-    records_lock = threading.Lock()
-    threads: List[threading.Thread] = []
-
-    print("\n" + "=" * 30 + " TRAFFIC SIMULATION RUNNING " + "=" * 30)
-    start_time = time.time()
-
-    for cid, tier, reqs, interval, comp in client_configs:
-        t = threading.Thread(
-            target=run_client_worker,
-            args=(
-                cid,
-                tier,
-                reqs,
-                interval,
-                comp,
-                nc,
-                args.poll_interval,
-                records_lock,
-                records,
-                not args.quiet,
-            ),
-        )
-        t.start()
-        threads.append(t)
-
-    for t in threads:
-        t.join()
-
-    elapsed = time.time() - start_time
-    print("=" * 30 + " TRAFFIC SIMULATION COMPLETE " + "=" * 30)
-
-    post_stats = nc.send_command("STATS")
-    print(f"Final Broker Stats: {post_stats}")
-
-    print_report(records, elapsed, pre_stats, post_stats)
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=7000)
+    p.add_argument("--preset", choices=sorted(PRESETS), default="standard")
+    p.add_argument("--poll-interval", type=float, default=0.1, help="seconds between polls per job")
+    p.add_argument("--max-poll-rate", type=float, default=20.0,
+                   help="per-client polls/sec cap; keep below DISTJOB_MAX_POLLS_PER_SEC (25)")
+    p.add_argument("--job-deadline", type=float, default=120.0, help="give up on a job after N seconds")
+    p.add_argument("--warmup", type=int, default=8, help="throwaway jobs before measuring (0 to disable)")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="divide submit intervals by this (e.g. 4 = 4x offered load) to get past the preset's ceiling")
+    p.add_argument("--json", help="write raw records + summary to this file")
+    asyncio.run(main_async(p.parse_args()))
 
 
 if __name__ == "__main__":

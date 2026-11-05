@@ -52,7 +52,7 @@ impl Default for Config {
             sandbox_type: SandboxType::Docker,
             docker_runtime: std::env::var("DISTJOB_DOCKER_RUNTIME").ok(), // e.g. "runsc"
             docker_memory: "128m".to_string(),
-            docker_cpus: "0.5".to_string(),
+            docker_cpus: "0.75".to_string(),
             docker_pids_limit: 64,
             docker_tmpfs_size: "64m".to_string(),
             enable_queue_limit: true,
