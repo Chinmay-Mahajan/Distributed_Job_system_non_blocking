@@ -37,6 +37,7 @@ pub struct Config {
     pub max_poll_strikes: u32,
     pub l2_penalty_ttl_secs: u64,
     pub client_idle_timeout: Duration,
+    pub auto_scale: bool,
 }
 
 impl Default for Config {
@@ -71,13 +72,33 @@ impl Default for Config {
             max_poll_strikes: 3,
             l2_penalty_ttl_secs: 60,
             client_idle_timeout: Duration::from_secs(300), // 5 minutes max inactivity before kicking idle client
+            auto_scale: false,
         }
     }
 }
 
 impl Config {
+    /// Detects host & Docker hardware capacity and updates worker count, prewarmed pool,
+    /// client cap, and store shards accordingly.
+    pub fn apply_auto_scale(&mut self) -> crate::machine_config::MachineProfile {
+        let profile = crate::machine_config::MachineProfile::make_from_machine();
+        let auto = profile.autoscale();
+        self.worker_count = auto.worker_count;
+        self.prewarmed_pool_size = auto.prewarmed_pool_size;
+        self.max_in_flight_per_client = auto.max_in_flight_per_client;
+        self.store_shards = auto.store_shards;
+        self.auto_scale = true;
+        profile
+    }
+
     pub fn from_env() -> Self {
         let mut config = Self::default();
+
+        if let Ok(val) = std::env::var("DISTJOB_AUTO") {
+            if matches!(val.to_lowercase().as_str(), "true" | "1" | "yes") {
+                config.apply_auto_scale();
+            }
+        }
 
         if let Ok(addr) = std::env::var("DISTJOB_BIND_ADDR") {
             config.bind_address = addr;
@@ -146,5 +167,25 @@ impl Config {
         }
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_auto_scale() {
+        let mut config = Config::default();
+        assert!(!config.auto_scale);
+        assert_eq!(config.worker_count, 4);
+
+        let profile = config.apply_auto_scale();
+        assert!(config.auto_scale);
+        assert!(config.worker_count >= 2);
+        assert_eq!(config.prewarmed_pool_size, config.worker_count);
+        assert!(config.max_in_flight_per_client >= 2);
+        assert!(config.store_shards >= 16);
+        assert_eq!(profile.effective_cpu(), profile.docker_cpu.unwrap_or(profile.num_core));
     }
 }

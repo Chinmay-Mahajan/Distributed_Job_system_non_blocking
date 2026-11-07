@@ -8,6 +8,7 @@ pub mod server;
 pub mod server_async;
 pub mod store;
 pub mod worker;
+pub mod machine_config;
 
 pub use auth::{AuthManager, SharedAuthManager};
 pub use config::{Config, SandboxType};
@@ -18,3 +19,4 @@ pub use server::BrokerServer;
 pub use server_async::AsyncBrokerServer;
 pub use store::ResultStore;
 pub use worker::WorkerPool;
+pub use machine_config::{AutoScaledConfig, MachineProfile};

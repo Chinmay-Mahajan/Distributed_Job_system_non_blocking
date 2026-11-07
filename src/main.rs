@@ -17,11 +17,18 @@ fn check_docker_available() -> bool {
 fn main() -> std::io::Result<()> {
     let mut config = Config::from_env();
 
+    let mut auto_requested = false;
+    let mut explicit_workers = None;
+    let mut explicit_client_cap = None;
+    let mut explicit_pool_size = None;
+    let mut explicit_shards = None;
+
     // Parse command line arguments with support for flags and positional values
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--auto" => auto_requested = true,
             "--docker" => config.sandbox_type = SandboxType::Docker,
             "--async" => config.enable_async_server = true,
             "--sync" => config.enable_async_server = false,
@@ -29,6 +36,7 @@ fn main() -> std::io::Result<()> {
                 if i + 1 < args.len() {
                     if let Ok(val) = args[i + 1].parse::<usize>() {
                         config.worker_count = val;
+                        explicit_workers = Some(val);
                     }
                     i += 1;
                 }
@@ -37,6 +45,7 @@ fn main() -> std::io::Result<()> {
                 if i + 1 < args.len() {
                     if let Ok(val) = args[i + 1].parse::<usize>() {
                         config.max_in_flight_per_client = val;
+                        explicit_client_cap = Some(val);
                     }
                     i += 1;
                 }
@@ -45,6 +54,7 @@ fn main() -> std::io::Result<()> {
                 if i + 1 < args.len() {
                     if let Ok(val) = args[i + 1].parse::<usize>() {
                         config.prewarmed_pool_size = val;
+                        explicit_pool_size = Some(val);
                     }
                     i += 1;
                 }
@@ -53,6 +63,7 @@ fn main() -> std::io::Result<()> {
                 if i + 1 < args.len() {
                     if let Ok(val) = args[i + 1].parse::<usize>() {
                         config.store_shards = val;
+                        explicit_shards = Some(val);
                     }
                     i += 1;
                 }
@@ -76,6 +87,7 @@ fn main() -> std::io::Result<()> {
                 println!("Usage: cargo run -- [OPTIONS]");
                 println!();
                 println!("Options:");
+                println!("  --auto                   Auto-scale workers, pool size, client cap, and shards based on hardware");
                 println!("  --async                  Run using Asynchronous Tokio connection model");
                 println!("  --sync                   Run using Synchronous thread-per-connection model (default)");
                 println!("  --docker                 Run using Docker sandbox (default)");
@@ -88,6 +100,7 @@ fn main() -> std::io::Result<()> {
                 println!("  --help, -h               Show this help message");
                 println!();
                 println!("Environment variables (can be set inline before 'cargo run'):");
+                println!("  DISTJOB_AUTO             e.g. DISTJOB_AUTO=1 (auto-scale based on hardware profile)");
                 println!("  DISTJOB_ASYNC            e.g. DISTJOB_ASYNC=1 (enables Tokio async model)");
                 println!("  DISTJOB_WORKERS          e.g. DISTJOB_WORKERS=16");
                 println!("  DISTJOB_CLIENT_CAP       e.g. DISTJOB_CLIENT_CAP=4");
@@ -108,6 +121,26 @@ fn main() -> std::io::Result<()> {
         i += 1;
     }
 
+    let machine_profile = if auto_requested || config.auto_scale {
+        let profile = config.apply_auto_scale();
+        // If specific CLI flags were provided, they override the auto-scaled values
+        if let Some(w) = explicit_workers {
+            config.worker_count = w;
+        }
+        if let Some(c) = explicit_client_cap {
+            config.max_in_flight_per_client = c;
+        }
+        if let Some(p) = explicit_pool_size {
+            config.prewarmed_pool_size = p;
+        }
+        if let Some(s) = explicit_shards {
+            config.store_shards = s;
+        }
+        Some(profile)
+    } else {
+        None
+    };
+
     if config.sandbox_type == SandboxType::Docker && !check_docker_available() {
         eprintln!(
             "[WARN] Docker daemon appears unreachable. Starting with Docker sandbox will cause jobs to fail if Docker is not started."
@@ -120,6 +153,28 @@ fn main() -> std::io::Result<()> {
     println!("============================================================");
     println!("          SANDBOXED JOB EXECUTION BROKER (v2)               ");
     println!("============================================================");
+    if let Some(ref prof) = machine_profile {
+        println!("  Auto-Scaling:        ENABLED");
+        println!(
+            "  Hardware Detected:   {} host cores, {:.2} GiB RAM",
+            prof.num_core,
+            prof.total_mem as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+        if prof.docker_available {
+            println!(
+                "  Docker Allocation:   {} cores, {:.2} GiB RAM",
+                prof.docker_cpu.unwrap_or(0),
+                prof.docker_gib.unwrap_or(0.0)
+            );
+        }
+        println!(
+            "  Effective Sizing:    {} cores, {:.2} GiB RAM",
+            prof.effective_cpu(),
+            prof.effective_mem_gib()
+        );
+    } else {
+        println!("  Auto-Scaling:        DISABLED (manual config)");
+    }
     println!("  Bind Address:        {}", config.bind_address);
     println!("  Connection Model:    {}", if config.enable_async_server { "Async (Tokio Event Loop)" } else { "Sync (Thread-per-Connection)" });
     println!("  Worker Threads:      {}", config.worker_count);

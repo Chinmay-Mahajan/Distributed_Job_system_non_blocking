@@ -392,7 +392,7 @@ impl DockerSandbox {
 
         let mut timed_out = false;
         let mut exit_status = None;
-
+        let mut sleep_ms = 1; 
         while start.elapsed() < timeout {
             // checking up on the child process. whether it is done .. (we cant wait forver hence the time constraint )
             // try_wait() basically non blocking version of wait() 
@@ -403,7 +403,8 @@ impl DockerSandbox {
                     break;
                 }
                 Ok(None) => {
-                    thread::sleep(Duration::from_millis(15));
+                    thread::sleep(Duration::from_millis(sleep_ms)); 
+                    sleep_ms = ( sleep_ms*2).min(20);
                 }
                 Err(e) => {
                     eprintln!("Error waiting on warm child: {}", e);
@@ -575,6 +576,7 @@ impl DockerSandbox {
 
         let mut timed_out = false;
         let mut exit_status = None;
+        let mut sleep_ms = 1;
 
         while start.elapsed() < timeout {
             match child.try_wait() {
@@ -583,7 +585,8 @@ impl DockerSandbox {
                     break;
                 }
                 Ok(None) => {
-                    thread::sleep(Duration::from_millis(25));
+                    thread::sleep(Duration::from_millis(sleep_ms));
+                    sleep_ms = (sleep_ms * 2).min(25);
                 }
                 Err(e) => {
                     eprintln!("Error waiting on child: {}", e);
