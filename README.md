@@ -100,7 +100,7 @@ flowchart TD
 
 ### 2.3 Dynamic Admission Control & Bufferbloat Prevention
 * **Configurable Backpressure:** Saturated clients can queue pending requests up to a configurable multiplier of their concurrency cap:
-  $$\text{Max Allowed Queue Depth} = \text{max\_in\_flight\_per\_client} \times \text{queue\_limit\_multiplier}$$
+  `max_allowed_queue_depth = max_in_flight_per_client * queue_limit_multiplier`
 * **Fast-Fail Memory Protection:** Excess requests beyond this quota are rejected immediately with a descriptive rate limit error before touching the [`ResultStore`](src/store.rs), preventing memory exhaustion and bufferbloat.
 * **Empirically Proven Fairness:** Under heavy asymmetric traffic (128 concurrent requests), legitimate tenants experienced **100% completion rates** with an average queue latency of just **1.3s – 1.7s**, while abusive high-frequency spammers were safely bounded.
 
@@ -133,11 +133,11 @@ The broker supports two interchangeable connection models toggleable at startup 
 ### 2.7 Dynamic Hardware Profiling & Empirical Auto-Scaling ([`src/machine_config.rs`](src/machine_config.rs))
 * **Host & Docker Resource Auto-Detection:** Automatically discovers physical host CPU cores and memory limits across macOS Darwin and Linux. In containerized or VM-backed environments (e.g., Docker Desktop on macOS), queries the Docker daemon (`docker info`) to determine effective CPUs and memory ceiling allocated to containers.
 * **Empirically Proven Sizing Model (`--auto` / `DISTJOB_AUTO=1`):**
-  * **Worker Threads ($W$):** Balances CPU cores against a 60% container memory budget ($2 \times 128\text{ MB}$ per execution slot to account for concurrent active + standby warm containers):
-    $$W = \text{clamp}(\min(\text{cpu\_workers}, \text{mem\_workers}), 2, 16)$$
-  * **Pre-Warmed Pool ($P$):** Scaled 1:1 with workers ($P = W$) so all workers can burst immediately without cold start overhead.
-  * **Per-Client In-Flight Cap ($C$):** Sized to $\max(2, \lfloor W / 3 \rfloor)$ to prevent single-tenant starvation while allowing fair concurrency.
-  * **ResultStore Shards ($S$):** Scaled to $\max(16, \text{next\_power\_of\_two}(W \times 4))$ to eliminate lock striping contention.
+  * **Worker Threads (`W`):** Balances CPU cores against a 60% container memory budget (2 × 128 MB per execution slot to account for concurrent active + standby warm containers):
+    `worker_count = clamp(min(cpu_workers, mem_workers), 2, 16)`
+  * **Pre-Warmed Pool (`P`):** Scaled 1:1 with workers (`P = W`) so all workers can burst immediately without cold start overhead.
+  * **Per-Client In-Flight Cap (`C`):** Sized to `max(2, floor(W / 3))` to prevent single-tenant starvation while allowing fair concurrency.
+  * **ResultStore Shards (`S`):** Scaled to `max(16, next_power_of_two(W * 4))` to eliminate lock striping contention.
 * **Preserved CLI Overrides:** Explicit CLI flags (e.g. `--auto -w 12`) take precedence over the auto-scaled recommendations while auto-scaling all other unconfigured parameters.
 * **Zero-Dependency Profiler Dashboard (`visualize_profile.py`):** Converts OS-level profile traces (e.g. macOS `/usr/bin/sample`) into an interactive, visual HTML dashboard (`profile_visualizer.html`) displaying thread distributions, call tree weights, and lock bottlenecks.
 
@@ -387,7 +387,7 @@ All settings can be specified via [`Config`](src/config.rs) or environment varia
 | **Workers** | `DISTJOB_WORKERS` | `4` | Number of execution worker threads (`-w`) |
 | **Per-Client Cap** | `DISTJOB_CLIENT_CAP` | `2` | Max concurrent in-flight jobs per client (`-c`) |
 | **Enable Queue Limit** | `DISTJOB_ENABLE_QUEUE_LIMIT` | `true` | Toggles per-client pending queue rate limiting |
-| **Queue Multiplier** | `DISTJOB_QUEUE_LIMIT_MULTIPLIER` | `5` | Multiplier defining queue limit: $\text{cap} \times \text{mult}$ |
+| **Queue Multiplier** | `DISTJOB_QUEUE_LIMIT_MULTIPLIER` | `5` | Multiplier defining queue limit: `cap * multiplier` |
 | **Two-Queue Scheduler**| `DISTJOB_ENABLE_TWO_QUEUE_SCHEDULER` | `true` | Toggles $O(1)$ two-queue engine vs legacy single-queue loop |
 | **Pre-Warmed Pool** | `DISTJOB_ENABLE_PREWARMED_POOL` | `true` | Toggles standby pre-warmed container pool |
 | **Pool Size** | `DISTJOB_PREWARMED_POOL_SIZE` | `4` | Number of standby containers kept in warm pool (`-p`) |

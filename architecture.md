@@ -258,7 +258,7 @@ struct InnerScheduler {
 
 #### 3.3.2 Dynamic Admission Gate & Bufferbloat Prevention
 Without admission limits, saturated clients can queue an unbounded number of jobs into memory, causing severe bufferbloat:
-$$\text{Max Queue Limit} = \text{max\_in\_flight\_per\_client} \times \text{queue\_limit\_multiplier}$$
+`max_allowed_queue_depth = max_in_flight_per_client * queue_limit_multiplier`
 * When enabled (`enable_queue_limit = true`, default: `true`, multiplier: `5`), any submission attempted by a client whose pending queue already satisfies `queued >= limit` is rejected immediately.
 * **Impact:** Rejections occur at the socket layer before touching the [`ResultStore`](src/store.rs), protecting broker memory and dropping tail latency by 60%.
 
@@ -400,7 +400,7 @@ Without strict lifecycle boundaries, clients that submit high-throughput jobs or
   - **Passive Purge on Read:** If `get(job_id)` or `poll_for_client` is invoked after expiry, the entry is immediately evicted and returns `None`.
   - **Active Background Janitor:** A lightweight background thread awakens every `cleanup_interval` (default: 30s) and scans the store, pruning stale entries.
 - **Lock Sharding (Striping) with `RwLock`:**
-  - Instead of a single monolithic lock, entries are striped across $S=32$ independent shards: $\text{shard} = \text{hash}(\text{job\_id}) \ \& \ (S - 1)$.
+  - Instead of a single monolithic lock, entries are striped across 32 independent shards: `shard = hash(job_id) & (num_shards - 1)`.
   - Writes (job completions, status transitions) only lock the specific shard holding that `job_id`, leaving all other shards unblocked.
   - The janitor thread prunes one shard at a time sequentially, eliminating the global stop-the-world "reaper freeze" across polling threads.
 
@@ -495,15 +495,15 @@ flowchart TD
 
 #### 3.7.2 Mathematical Sizing Model
 Derived from extensive grid search benchmarking across `light` and `heavy` workloads:
-* **Worker Count ($W$):**
+* **Worker Count (`W`):**
   Each execution slot requires up to two containers: an active container running code and a warm container queued in standby. Allocating a safe 60% memory budget to containers with 128 MB per container yields:
-  $$W_{\text{mem}} = \left\lfloor \frac{\text{effective\_mem} \times 0.60}{2 \times 128\text{ MB}} \right\rfloor$$
-  $$W = \text{clamp}(\min(W_{\text{cpu}}, W_{\text{mem}}), 2, 16)$$
-* **Prewarmed Pool Size ($P = W$):**
+  `mem_workers = floor((effective_mem * 0.60) / (2 * 128 MB))`
+  `worker_count = clamp(min(cpu_workers, mem_workers), 2, 16)`
+* **Prewarmed Pool Size (`P = W`):**
   Matching warm pool capacity to the worker count ensures that when all workers are dispatched concurrently during a traffic spike, 100% of workers hit warm containers with zero cold start penalty.
-* **Per-Client In-Flight Cap ($C = \max(2, \lfloor W / 3 \rfloor)$):**
+* **Per-Client In-Flight Cap (`C = max(2, floor(W / 3))`):**
   Limits any single tenant to ~33% of the execution pool, guaranteeing that at least two distinct tenants can execute simultaneously under saturation.
-* **ResultStore Shard Count ($S = \max(16, \text{next\_power\_of\_two}(W \times 4))$):**
+* **ResultStore Shard Count (`S = max(16, next_power_of_two(W * 4))`):**
   Ensures lock-striping granularity provides at least 4 independent shards per worker thread, eliminating lock contention on job insertion, polling, and TTL reap sweeps.
 
 #### 3.7.3 CLI Invocation & Override Precedence
