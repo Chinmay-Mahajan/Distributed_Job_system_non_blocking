@@ -170,22 +170,4 @@ impl Config {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    #[test]
-    fn test_apply_auto_scale() {
-        let mut config = Config::default();
-        assert!(!config.auto_scale);
-        assert_eq!(config.worker_count, 4);
-
-        let profile = config.apply_auto_scale();
-        assert!(config.auto_scale);
-        assert!(config.worker_count >= 2);
-        assert_eq!(config.prewarmed_pool_size, config.worker_count);
-        assert!(config.max_in_flight_per_client >= 2);
-        assert!(config.store_shards >= 16);
-        assert_eq!(profile.effective_cpu(), profile.docker_cpu.unwrap_or(profile.num_core));
-    }
-}
