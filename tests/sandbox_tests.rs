@@ -34,3 +34,31 @@ fn test_prewarmed_pool_lifecycle_and_shutdown() {
     pool.shutdown();
 }
 
+#[test]
+fn test_nsjail_sandbox_config_and_unsupported_language() {
+    use distributed_jobv2::model::Job;
+    use distributed_jobv2::sandbox::{NsjailSandbox, Sandbox};
+
+    let mut config = Config::default();
+    config.nsjail_bin = "nonexistent_nsjail_binary_123".to_string();
+    config.nsjail_rootfs = "/tmp/fake_rootfs".to_string();
+
+    let sandbox = NsjailSandbox::new(&config);
+    assert_eq!(sandbox.nsjail_bin, "nonexistent_nsjail_binary_123");
+    assert_eq!(sandbox.rootfs_path, "/tmp/fake_rootfs");
+
+    // Unsupported language should fast-fail
+    let job = Job {
+        id: uuid::Uuid::new_v4().to_string(),
+        client_id: "test-client".to_string(),
+        language: "rust_unsupported".to_string(),
+        code: "fn main() {}".to_string(),
+        stdin: None,
+        timeout_secs: 5,
+        created_at_ms: 0,
+    };
+    let res = sandbox.execute(&job);
+    assert_eq!(res.status, distributed_jobv2::model::JobState::Failed);
+    assert!(res.stderr.contains("Unsupported language"));
+}
+

@@ -4,6 +4,8 @@ use std::time::Duration;
 pub enum SandboxType {
     /// Full Docker sandbox with gVisor / limits as specified in plan.md
     Docker,
+    /// Fast lightweight Linux namespaces sandbox via nsjail
+    Nsjail,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +40,9 @@ pub struct Config {
     pub l2_penalty_ttl_secs: u64,
     pub client_idle_timeout: Duration,
     pub auto_scale: bool,
+    pub nsjail_bin: String,
+    pub nsjail_rootfs: String,
+    pub nsjail_enable_cgroups: bool,
 }
 
 impl Default for Config {
@@ -73,6 +78,9 @@ impl Default for Config {
             l2_penalty_ttl_secs: 60,
             client_idle_timeout: Duration::from_secs(300), // 5 minutes max inactivity before kicking idle client
             auto_scale: false,
+            nsjail_bin: "nsjail".to_string(),
+            nsjail_rootfs: "./rootfs".to_string(),
+            nsjail_enable_cgroups: false,
         }
     }
 }
@@ -110,9 +118,20 @@ impl Config {
             config.max_in_flight_per_client = val;
         }
         if let Ok(s_type) = std::env::var("DISTJOB_SANDBOX") {
-            if s_type.to_lowercase().as_str() == "docker" {
-                config.sandbox_type = SandboxType::Docker;
+            match s_type.to_lowercase().as_str() {
+                "docker" => config.sandbox_type = SandboxType::Docker,
+                "nsjail" => config.sandbox_type = SandboxType::Nsjail,
+                _ => {}
             }
+        }
+        if let Ok(bin) = std::env::var("DISTJOB_NSJAIL_BIN") {
+            config.nsjail_bin = bin;
+        }
+        if let Ok(rootfs) = std::env::var("DISTJOB_ROOTFS") {
+            config.nsjail_rootfs = rootfs;
+        }
+        if let Ok(cg) = std::env::var("DISTJOB_NSJAIL_CGROUPS") {
+            config.nsjail_enable_cgroups = matches!(cg.to_lowercase().as_str(), "true" | "1" | "yes");
         }
         if let Ok(Ok(val)) = std::env::var("DISTJOB_TTL_SECS").map(|t| t.parse::<u64>()) {
             config.result_ttl = Duration::from_secs(val);

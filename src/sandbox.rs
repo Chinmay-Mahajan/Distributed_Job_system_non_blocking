@@ -677,3 +677,193 @@ impl Sandbox for DockerSandbox {
     }
 }
 
+// ---------------------------------------------------------------------------
+// nsjail Sandbox (Lightweight Linux Namespaces & Seccomp Sandbox)
+// ---------------------------------------------------------------------------
+
+fn parse_memory_bytes(mem: &str) -> u64 {
+    let trimmed = mem.trim();
+    if let Some(val) = trimmed.strip_suffix(|c| c == 'm' || c == 'M') {
+        val.parse::<u64>().unwrap_or(128) * 1024 * 1024
+    } else if let Some(val) = trimmed.strip_suffix(|c| c == 'g' || c == 'G') {
+        val.parse::<u64>().unwrap_or(1) * 1024 * 1024 * 1024
+    } else if let Some(val) = trimmed.strip_suffix(|c| c == 'k' || c == 'K') {
+        val.parse::<u64>().unwrap_or(128 * 1024) * 1024
+    } else {
+        trimmed.parse::<u64>().unwrap_or(128 * 1024 * 1024)
+    }
+}
+
+pub struct NsjailSandbox {
+    pub nsjail_bin: String,
+    pub rootfs_path: String,
+    pub memory_limit_bytes: u64,
+    pub pids_limit: u64,
+    pub enable_cgroups: bool,
+}
+
+impl NsjailSandbox {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            nsjail_bin: config.nsjail_bin.clone(),
+            rootfs_path: config.nsjail_rootfs.clone(),
+            memory_limit_bytes: parse_memory_bytes(&config.docker_memory),
+            pids_limit: config.docker_pids_limit,
+            enable_cgroups: config.nsjail_enable_cgroups,
+        }
+    }
+}
+
+impl Sandbox for NsjailSandbox {
+    fn execute(&self, job: &Job) -> SandboxExecutionResult {
+        let start = Instant::now();
+        let timeout = Duration::from_secs(job.timeout_secs);
+
+        let (exec_binary, exec_args) = match job.language.to_lowercase().as_str() {
+            "sh" | "bash" | "shell" => ("/bin/sh", vec!["-c", &job.code]),
+            "python" | "python3" | "py" => ("/usr/local/bin/python3", vec!["-c", &job.code]),
+            other => {
+                return SandboxExecutionResult {
+                    status: JobState::Failed,
+                    stdout: String::new(),
+                    stderr: format!("Unsupported language for nsjail: '{}'", other),
+                    exit_code: Some(1),
+                    error_message: Some(format!("Unsupported language: '{}'", other)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        let mut cmd = Command::new(&self.nsjail_bin);
+        cmd.arg("-Q") // really quiet (fatal messages only)
+            .arg("--mode").arg("o") // standalone once
+            .arg("--chroot").arg(&self.rootfs_path)
+            .arg("--user").arg("1000")
+            .arg("--group").arg("1000")
+            .arg("--time_limit").arg(job.timeout_secs.to_string())
+            .arg("--disable_proc")
+            .arg("--rw")
+            .arg("--mount").arg("none:/tmp:tmpfs:size=67108864");
+
+        if self.enable_cgroups {
+            cmd.arg("--detect_cgroupv2")
+                .arg("--cgroup_mem_max").arg(self.memory_limit_bytes.to_string())
+                .arg("--cgroup_pids_max").arg(self.pids_limit.to_string());
+        }
+
+        cmd.arg("--").arg(exec_binary);
+        for a in exec_args {
+            cmd.arg(a);
+        }
+
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return SandboxExecutionResult {
+                    status: JobState::Failed,
+                    stdout: String::new(),
+                    stderr: format!("Failed to spawn nsjail binary ('{}'): {}. Ensure nsjail is installed.", self.nsjail_bin, e),
+                    exit_code: Some(1),
+                    error_message: Some(format!("nsjail spawn error: {}", e)),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                };
+            }
+        };
+
+        // Write stdin if provided and close pipe to send EOF
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Some(ref input) = job.stdin {
+                let _ = stdin.write_all(input.as_bytes());
+            }
+        }
+
+        let mut stdout_handle = child.stdout.take().unwrap();
+        let mut stderr_handle = child.stderr.take().unwrap();
+
+        let stdout_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stdout_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut stdout_handle, &mut std::io::sink());
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let stderr_thread = thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = (&mut stderr_handle).take(MAX_OUTPUT_BYTES).read_to_end(&mut buf);
+            let _ = std::io::copy(&mut stderr_handle, &mut std::io::sink());
+            String::from_utf8_lossy(&buf).to_string()
+        });
+
+        let mut timed_out = false;
+        let mut exit_status = None;
+        let mut sleep_ms = 1;
+
+        while start.elapsed() < timeout {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    exit_status = Some(status);
+                    break;
+                }
+                Ok(None) => {
+                    thread::sleep(Duration::from_millis(sleep_ms));
+                    sleep_ms = (sleep_ms * 2).min(20);
+                }
+                Err(e) => {
+                    eprintln!("Error waiting on nsjail child: {}", e);
+                    break;
+                }
+            }
+        }
+
+        if exit_status.is_none() {
+            timed_out = true;
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        let stdout = stdout_thread.join().unwrap_or_default();
+        let mut stderr = stderr_thread.join().unwrap_or_default();
+        let duration_ms = start.elapsed().as_millis() as u64;
+
+        if timed_out {
+            stderr.push_str(&format!(
+                "\n[Broker] Execution timed out after {} seconds and was forcibly killed.",
+                job.timeout_secs
+            ));
+            SandboxExecutionResult {
+                status: JobState::TimedOut,
+                stdout,
+                stderr,
+                exit_code: None,
+                error_message: Some(format!("Job timed out after {} seconds", job.timeout_secs)),
+                duration_ms,
+            }
+        } else {
+            let code = exit_status.and_then(|s| s.code());
+            let status = match code {
+                Some(0) => JobState::Done,
+                Some(137) => JobState::TimedOut, // 128 + 9 (SIGKILL from nsjail's time_limit)
+                _ => JobState::Failed,
+            };
+            SandboxExecutionResult {
+                status,
+                stdout,
+                stderr,
+                exit_code: code,
+                error_message: if status == JobState::Failed {
+                    Some(format!("Process exited with code {:?}", code))
+                } else if status == JobState::TimedOut {
+                    Some(format!("Job timed out after {} seconds (SIGKILL)", job.timeout_secs))
+                } else {
+                    None
+                },
+                duration_ms,
+            }
+        }
+    }
+}
+

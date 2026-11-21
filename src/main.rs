@@ -30,6 +30,20 @@ fn main() -> std::io::Result<()> {
         match args[i].as_str() {
             "--auto" => auto_requested = true,
             "--docker" => config.sandbox_type = SandboxType::Docker,
+            "--nsjail" => config.sandbox_type = SandboxType::Nsjail,
+            "--rootfs" => {
+                if i + 1 < args.len() {
+                    config.nsjail_rootfs = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--nsjail-bin" => {
+                if i + 1 < args.len() {
+                    config.nsjail_bin = args[i + 1].clone();
+                    i += 1;
+                }
+            }
+            "--nsjail-cgroups" => config.nsjail_enable_cgroups = true,
             "--async" => config.enable_async_server = true,
             "--sync" => config.enable_async_server = false,
             "--workers" | "-w" => {
@@ -91,6 +105,10 @@ fn main() -> std::io::Result<()> {
                 println!("  --async                  Run using Asynchronous Tokio connection model");
                 println!("  --sync                   Run using Synchronous thread-per-connection model (default)");
                 println!("  --docker                 Run using Docker sandbox (default)");
+                println!("  --nsjail                 Run using lightweight Linux nsjail sandbox");
+                println!("  --rootfs <DIR>           Rootfs directory for nsjail (default: ./rootfs)");
+                println!("  --nsjail-bin <PATH>      Path to nsjail binary (default: nsjail)");
+                println!("  --nsjail-cgroups         Enable cgroups v2 resource limits in nsjail");
                 println!("  --workers, -w <N>        Number of worker threads (default: 4)");
                 println!("  --client-cap, -c <N>     Max in-flight jobs per client (default: 2)");
                 println!("  --pool-size, -p <N>      Prewarmed Docker pool size (default: 4)");
@@ -106,7 +124,10 @@ fn main() -> std::io::Result<()> {
                 println!("  DISTJOB_CLIENT_CAP       e.g. DISTJOB_CLIENT_CAP=4");
                 println!("  DISTJOB_PREWARMED_POOL_SIZE e.g. DISTJOB_PREWARMED_POOL_SIZE=8");
                 println!("  DISTJOB_STORE_SHARDS     e.g. DISTJOB_STORE_SHARDS=32");
-                println!("  DISTJOB_SANDBOX          e.g. DISTJOB_SANDBOX=local");
+                println!("  DISTJOB_SANDBOX          e.g. DISTJOB_SANDBOX=docker or DISTJOB_SANDBOX=nsjail");
+                println!("  DISTJOB_ROOTFS           e.g. DISTJOB_ROOTFS=./rootfs");
+                println!("  DISTJOB_NSJAIL_BIN       e.g. DISTJOB_NSJAIL_BIN=/usr/local/bin/nsjail");
+                println!("  DISTJOB_NSJAIL_CGROUPS   e.g. DISTJOB_NSJAIL_CGROUPS=1");
                 println!("  DISTJOB_BIND_ADDR        e.g. DISTJOB_BIND_ADDR=127.0.0.1:7000");
                 println!("  DISTJOB_TTL_SECS         e.g. DISTJOB_TTL_SECS=600");
                 return Ok(());
@@ -180,7 +201,13 @@ fn main() -> std::io::Result<()> {
     println!("  Worker Threads:      {}", config.worker_count);
     println!("  Per-Client Cap:      {}", config.max_in_flight_per_client);
     println!("  Sandbox Type:        {:?}", config.sandbox_type);
-    println!("  Prewarmed Pool:      {} (enabled: {})", config.prewarmed_pool_size, config.enable_prewarmed_pool);
+    if config.sandbox_type == SandboxType::Nsjail {
+        println!("  Nsjail Binary:       {}", config.nsjail_bin);
+        println!("  Nsjail Rootfs:       {}", config.nsjail_rootfs);
+        println!("  Nsjail Cgroups:      {}", if config.nsjail_enable_cgroups { "Enabled" } else { "Disabled" });
+    } else {
+        println!("  Prewarmed Pool:      {} (enabled: {})", config.prewarmed_pool_size, config.enable_prewarmed_pool);
+    }
     println!("  ResultStore Shards:  {}", config.store_shards);
     println!("  Result TTL:          {:?}", config.result_ttl);
     println!("============================================================");

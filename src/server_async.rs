@@ -41,6 +41,7 @@ impl AsyncBrokerServer {
     pub fn new(config: Config) -> Self {
         let sandbox: Arc<dyn Sandbox> = match config.sandbox_type {
             SandboxType::Docker => Arc::new(DockerSandbox::new(&config)),
+            SandboxType::Nsjail => Arc::new(crate::sandbox::NsjailSandbox::new(&config)),
         };
 
         let scheduler = Arc::new(TwoLevelScheduler::from_config(&config));
