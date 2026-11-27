@@ -1,5 +1,7 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -9,6 +11,49 @@ use distributed_jobv2::config::{Config, SandboxType};
 use distributed_jobv2::model::{JobResult, JobState, ServerResponse};
 use distributed_jobv2::server::BrokerServer;
 use distributed_jobv2::server_async::AsyncBrokerServer;
+
+const TEST_LOG_FILE: &str = "test_job_results.log";
+
+/// Resets the diagnostic test log by removing any previous log file.
+fn init_or_reset_test_log() {
+    let log_path = Path::new(TEST_LOG_FILE);
+    if log_path.exists() {
+        let _ = fs::remove_file(log_path);
+    }
+}
+
+/// Appends a structured job outcome record to the diagnostic test log file.
+fn append_job_log(test_name: &str, job_id: &str, code: &str, result: &JobResult) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(TEST_LOG_FILE)
+        .expect("open test_job_results.log");
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    writeln!(file, "================================================================================").unwrap();
+    writeln!(file, "[TIMESTAMP: {} ms] TEST: {}", now, test_name).unwrap();
+    writeln!(file, "--------------------------------------------------------------------------------").unwrap();
+    writeln!(file, "Job ID:       {}", job_id).unwrap();
+    writeln!(file, "Client ID:    {}", result.client_id).unwrap();
+    writeln!(file, "Status:       {:?}", result.status).unwrap();
+    writeln!(file, "Exit Code:    {:?}", result.exit_code).unwrap();
+    writeln!(file, "Duration:     {:?} ms", result.execution_duration_ms).unwrap();
+    writeln!(file, "Created At:   {} ms", result.created_at_ms).unwrap();
+    writeln!(file, "Completed At: {:?} ms", result.completed_at_ms).unwrap();
+    writeln!(file, "Code:\n{}", code).unwrap();
+    writeln!(file, "--- STDOUT ---\n{}", result.stdout.trim_end()).unwrap();
+    writeln!(file, "--- STDERR ---\n{}", result.stderr.trim_end()).unwrap();
+    if let Some(ref err) = result.error_message {
+        writeln!(file, "--- ERROR MESSAGE ---\n{}", err).unwrap();
+    }
+    writeln!(file, "================================================================================\n").unwrap();
+    let _ = file.flush();
+}
 
 fn start_test_server(sandbox_type: SandboxType, max_in_flight: usize) -> (String, Arc<BrokerServer>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
@@ -108,6 +153,13 @@ fn test_e2e_json_submit_and_poll() {
     assert_eq!(final_res.status, JobState::Done);
     assert!(final_res.stdout.contains("hello from e2e test"));
     assert_eq!(final_res.client_id, expected_hash);
+
+    append_job_log(
+        "test_e2e_json_submit_and_poll",
+        &job_id,
+        "print('hello from e2e test')",
+        &final_res,
+    );
 }
 
 #[test]
@@ -708,6 +760,112 @@ fn test_e2e_kick_idle_and_expired_connections() {
         0,
         "Kicked client's unpopped results must be purged from ResultStore"
     );
+
+    server.shutdown();
+}
+
+#[test]
+fn test_e2e_job_results_file_logging() {
+    // 0. Ensure previous test logs are cleaned up first before logging new test run
+    init_or_reset_test_log();
+    assert!(!Path::new(TEST_LOG_FILE).exists(), "Previous test log must be deleted before new test run");
+
+    let (addr, server) = start_test_server(SandboxType::Docker, 2);
+    let mut stream = TcpStream::connect(&addr).expect("connect to broker");
+    let mut reader = BufReader::new(stream.try_clone().expect("clone stream"));
+
+    let secret_key = register_client_json(&mut stream, &mut reader);
+
+    // 1. Submit and execute a successful job
+    let code_ok = "print('SUCCESS_LOG_MARKER_99'); print('Sum:', 20 + 22)";
+    let submit_req = serde_json::json!({
+        "action": "SUBMIT",
+        "secret_key": secret_key,
+        "language": "python",
+        "code": code_ok,
+        "timeout_secs": 5
+    });
+    writeln!(stream, "{}", submit_req).unwrap();
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line).unwrap();
+    let submit_resp: ServerResponse = serde_json::from_str(response_line.trim()).unwrap();
+    let job_id_ok = match submit_resp {
+        ServerResponse::SubmitOk { job_id, .. } => job_id,
+        other => panic!("Unexpected response: {:?}", other),
+    };
+
+    // Poll until complete
+    let mut res_ok: Option<JobResult> = None;
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(50));
+        let poll_req = serde_json::json!({
+            "action": "POLL",
+            "secret_key": secret_key,
+            "job_id": job_id_ok
+        });
+        writeln!(stream, "{}", poll_req).unwrap();
+        response_line.clear();
+        reader.read_line(&mut response_line).unwrap();
+        if let Ok(res) = serde_json::from_str::<JobResult>(response_line.trim())
+            && (res.status == JobState::Done || res.status == JobState::Failed)
+        {
+            res_ok = Some(res);
+            break;
+        }
+    }
+    let res_ok = res_ok.expect("successful job should complete");
+    assert_eq!(res_ok.status, JobState::Done);
+    append_job_log("test_e2e_job_results_file_logging [SUCCESS CASE]", &job_id_ok, code_ok, &res_ok);
+
+    // 2. Submit and execute a deliberately failing job (to log error diagnostics)
+    let code_fail = "import sys; sys.stderr.write('DELIBERATE_TEST_FAILURE_DETAIL\\n'); sys.exit(42)";
+    let submit_req_fail = serde_json::json!({
+        "action": "SUBMIT",
+        "secret_key": secret_key,
+        "language": "python",
+        "code": code_fail,
+        "timeout_secs": 5
+    });
+    writeln!(stream, "{}", submit_req_fail).unwrap();
+    response_line.clear();
+    reader.read_line(&mut response_line).unwrap();
+    let submit_resp_fail: ServerResponse = serde_json::from_str(response_line.trim()).unwrap();
+    let job_id_fail = match submit_resp_fail {
+        ServerResponse::SubmitOk { job_id, .. } => job_id,
+        other => panic!("Unexpected response: {:?}", other),
+    };
+
+    let mut res_fail: Option<JobResult> = None;
+    for _ in 0..50 {
+        thread::sleep(Duration::from_millis(50));
+        let poll_req = serde_json::json!({
+            "action": "POLL",
+            "secret_key": secret_key,
+            "job_id": job_id_fail
+        });
+        writeln!(stream, "{}", poll_req).unwrap();
+        response_line.clear();
+        reader.read_line(&mut response_line).unwrap();
+        if let Ok(res) = serde_json::from_str::<JobResult>(response_line.trim())
+            && (res.status == JobState::Done || res.status == JobState::Failed)
+        {
+            res_fail = Some(res);
+            break;
+        }
+    }
+    let res_fail = res_fail.expect("failing job should finish");
+    assert_eq!(res_fail.status, JobState::Failed);
+    append_job_log("test_e2e_job_results_file_logging [FAILURE CASE]", &job_id_fail, code_fail, &res_fail);
+
+    // 3. Verify log file exists and contains full diagnostic details
+    assert!(Path::new(TEST_LOG_FILE).exists(), "Log file must exist after jobs are logged");
+    let log_contents = fs::read_to_string(TEST_LOG_FILE).expect("read test log file");
+
+    assert!(log_contents.contains("SUCCESS_LOG_MARKER_99"), "Log must contain stdout from successful job");
+    assert!(log_contents.contains("Status:       Done"), "Log must record Done status");
+    assert!(log_contents.contains("DELIBERATE_TEST_FAILURE_DETAIL"), "Log must contain stderr from failed job");
+    assert!(log_contents.contains("Status:       Failed"), "Log must record Failed status");
+    assert!(log_contents.contains("Exit Code:    Some(42)"), "Log must record exit code 42");
 
     server.shutdown();
 }

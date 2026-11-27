@@ -14,6 +14,54 @@ fn check_docker_available() -> bool {
         .unwrap_or(false)
 }
 
+fn validate_nsjail_preflight(config: &Config) -> Result<(), String> {
+    let output = Command::new(&config.nsjail_bin)
+        .arg("--help")
+        .output();
+
+    match output {
+        Ok(out) => {
+            if out.status.success() {
+                Ok(())
+            } else {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if stderr.contains("is not running") || stderr.contains("No such container") {
+                    Err(format!(
+                        "The nsjail bridge container 'nsjail-dev' is not running.\n\
+                         Please start it with:\n  docker start nsjail-dev\n\
+                         Or run the setup script:\n  ./scripts/setup_nsjail.sh"
+                    ))
+                } else {
+                    Err(format!(
+                        "Nsjail pre-flight check exited with error ({}):\n{}",
+                        out.status, stderr
+                    ))
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if cfg!(target_os = "macos") && config.nsjail_bin == "nsjail" {
+                Err(format!(
+                    "Nsjail binary 'nsjail' was not found on your macOS host.\n\
+                     On macOS, nsjail runs inside the 'nsjail-dev' Docker container.\n\
+                     Please run './scripts/setup_nsjail.sh' or pass:\n  \
+                     --nsjail-bin ./scripts/nsjail_docker_shim.sh --rootfs /workspace/rootfs"
+                ))
+            } else {
+                Err(format!(
+                    "Failed to execute nsjail binary ('{}'): {}.\n\
+                     Ensure nsjail is installed or the binary path is correct.",
+                    config.nsjail_bin, e
+                ))
+            }
+        }
+        Err(e) => Err(format!(
+            "Failed to spawn nsjail binary ('{}'): {}",
+            config.nsjail_bin, e
+        )),
+    }
+}
+
 fn main() -> std::io::Result<()> {
     let mut config = Config::from_env();
 
@@ -162,6 +210,19 @@ fn main() -> std::io::Result<()> {
         None
     };
 
+    // macOS auto-detection for nsjail:
+    // If running on macOS with --nsjail and no explicit --nsjail-bin was specified:
+    #[cfg(target_os = "macos")]
+    if config.sandbox_type == SandboxType::Nsjail && config.nsjail_bin == "nsjail" {
+        let shim_path = "./scripts/nsjail_docker_shim.sh";
+        if std::path::Path::new(shim_path).exists() {
+            config.nsjail_bin = shim_path.to_string();
+            if config.nsjail_rootfs == "./rootfs" {
+                config.nsjail_rootfs = "/workspace/rootfs".to_string();
+            }
+        }
+    }
+
     if config.sandbox_type == SandboxType::Docker && !check_docker_available() {
         eprintln!(
             "[WARN] Docker daemon appears unreachable. Starting with Docker sandbox will cause jobs to fail if Docker is not started."
@@ -169,6 +230,16 @@ fn main() -> std::io::Result<()> {
         eprintln!(
             "[INFO] To use local process sandbox for testing/development, run with --local or set DISTJOB_SANDBOX=local."
         );
+    }
+
+    if config.sandbox_type == SandboxType::Nsjail {
+        if let Err(err_msg) = validate_nsjail_preflight(&config) {
+            eprintln!("============================================================");
+            eprintln!("[FATAL] Nsjail Pre-Flight Validation Failed:");
+            eprintln!("{}", err_msg);
+            eprintln!("============================================================");
+            std::process::exit(1);
+        }
     }
 
     println!("============================================================");
@@ -202,7 +273,15 @@ fn main() -> std::io::Result<()> {
     println!("  Per-Client Cap:      {}", config.max_in_flight_per_client);
     println!("  Sandbox Type:        {:?}", config.sandbox_type);
     if config.sandbox_type == SandboxType::Nsjail {
+        #[cfg(target_os = "macos")]
+        if config.nsjail_bin == "./scripts/nsjail_docker_shim.sh" {
+            println!("  Nsjail Binary:       {} (macOS bridge auto-detected)", config.nsjail_bin);
+        } else {
+            println!("  Nsjail Binary:       {}", config.nsjail_bin);
+        }
+        #[cfg(not(target_os = "macos"))]
         println!("  Nsjail Binary:       {}", config.nsjail_bin);
+
         println!("  Nsjail Rootfs:       {}", config.nsjail_rootfs);
         println!("  Nsjail Cgroups:      {}", if config.nsjail_enable_cgroups { "Enabled" } else { "Disabled" });
     } else {

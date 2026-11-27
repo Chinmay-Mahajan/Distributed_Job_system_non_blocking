@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 *.pyo
 /rootfs
+test_job_results.log
+stress_job_results.log
+*.log

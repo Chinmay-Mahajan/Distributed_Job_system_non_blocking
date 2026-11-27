@@ -169,6 +169,7 @@ impl PrewarmedContainerPool {
     }
 
     fn replenish_loop(&self) {
+        // this inner while loop does this , it keeps checking if the num of currently alive containers (ie currently executing + containers being ) is less than the pool size , so that we dont over spawn the containers. 
         while !self.shutdown.load(Ordering::Relaxed) {
             {
             let mut available = self.available.lock().unwrap();
@@ -183,8 +184,7 @@ impl PrewarmedContainerPool {
             }
 
             // self.pool_size.saturating_sub(available.len()); 
-            self.spawning_count.fetch_add(1, Ordering::SeqCst); 
-            
+            self.spawning_count.fetch_add(1, Ordering::SeqCst);  // add one to the spawning count (the num of containers currently being spawned) if the num of containers (alive) are less than the pool size 
 
           
         }
@@ -737,18 +737,43 @@ impl Sandbox for NsjailSandbox {
         let mut cmd = Command::new(&self.nsjail_bin);
         cmd.arg("-Q") // really quiet (fatal messages only)
             .arg("--mode").arg("o") // standalone once
-            .arg("--chroot").arg(&self.rootfs_path)
+            .arg("--chroot").arg(&self.rootfs_path) // refers to the rootfile system of the nsjail sandbox 
             .arg("--user").arg("1000")
             .arg("--group").arg("1000")
             .arg("--time_limit").arg(job.timeout_secs.to_string())
-            .arg("--disable_proc")
-            .arg("--rw")
-            .arg("--mount").arg("none:/tmp:tmpfs:size=67108864");
+            .arg("--disable_proc") // disables mounting of proc file system to the sandbox
+            .arg("--disable_clone_newuser") // disables nested user namespace so read-only rootfs remount succeeds
+            .arg("--mount").arg("none:/tmp:tmpfs:size=67108864"); // ephemeral in-memory tmpfs per job (evaporates on process exit) 
+
+        // a issue with the previous code here was that , since we were mounting the filesystem as rw any changes to the rootfs would be reflected to the .rootfs dir on the host (since we mount this dir inside the docker container which runs the nsjail binary) 
+        // because of that the file system was commmon and easily readable / writable to other clients too. 
+
+        // the rw flag was added (due to negligence on my part , i did not think very hard) , but the rough idea was this . NsJail by default has a ReadOnly filesystem but the nsjail process is running in a user namespace and hence isnt privilaged outside this namespace the linux kernel doesnot allow it to change the mode (ro , rw) of the filesystem . 
+        // hence my coding agent used -rw to explicitly run nsjail to allow writes to the filesystem . 
+
+        // The fixes were : removed rw flag . disabled_clone_newuser , which in the source code of nsjail has definition : 
+
+        //"disable_clone_newuser", no_argument, nullptr, 0x0402 }, "Don't use CLONE_NEWUSER. Requires euid==0" }  
+
+        // Which basically just disables the formation of a new user namespace , so that nsjail can modify the filesystem to be read only. 
+
+        // we did allow writes to tmp dir though , but that dir is emphermal . And we mount it as tmpfs so it is in memory (ram) 
+
 
         if self.enable_cgroups {
             cmd.arg("--detect_cgroupv2")
                 .arg("--cgroup_mem_max").arg(self.memory_limit_bytes.to_string())
                 .arg("--cgroup_pids_max").arg(self.pids_limit.to_string());
+        } 
+        else {
+            //when enable_cgroups is false (e.g. inside a Docker container without cgroup delegation),
+            // we fall back to Nsjail's native kernel rlimits.
+            let mem_mb = (self.memory_limit_bytes / (1024 * 1024)).max(1);
+            cmd.arg("--rlimit_as").arg(mem_mb.to_string())
+                .arg("--rlimit_nproc").arg(self.pids_limit.to_string()) // fork bombs 
+                .arg("--rlimit_fsize").arg("16") // cap single file writes to 16 MB
+                .arg("--rlimit_core").arg("0");  // disable core dumps to prevent disk bloat
+            //memory (RLIMIT_AS), num of processes/threads (fork bombs via RLIMIT_NPROC), max file size (RLIMIT_FSIZE).
         }
 
         cmd.arg("--").arg(exec_binary);

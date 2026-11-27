@@ -47,6 +47,31 @@ WORKLOADS = {
 }
 
 TERMINAL_STATUSES = (b"+Done", b"+Failed", b"+TimedOut")
+DEFAULT_STRESS_LOG_FILE = "stress_job_results.log"
+
+
+def init_or_reset_stress_log(path: str = DEFAULT_STRESS_LOG_FILE):
+    """Deletes previous stress test logs if they exist so this run starts fresh."""
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def log_stress_job(f, job_id: str, status: str, code: bytes, stderr: str):
+    """Logs job outcome recording only stderr and stdin/code (explicitly no time/timestamps)."""
+    if f is None:
+        return
+    code_str = code.decode("utf-8", errors="replace")
+    f.write(
+        f"================================================================================\n"
+        f"Job ID:       {job_id}\n"
+        f"Status:       {status}\n"
+        f"--- STDIN / CODE ---\n{code_str}\n"
+        f"--- STDERR ---\n{stderr.strip()}\n"
+        f"================================================================================\n\n"
+    )
 
 
 class LatencyBreakdown:
@@ -103,7 +128,7 @@ class StressClient:
             await self.writer.drain()
             return await self.reader.readline()
 
-    async def run_worker_loop(self, stop_time: float, latencies: LatencyBreakdown, stats: dict):
+    async def run_worker_loop(self, stop_time: float, latencies: LatencyBreakdown, stats: dict, log_f=None):
         while time.monotonic() < stop_time:
             self.next_req_id += 1
             lang, code = self.workload[self.next_req_id % len(self.workload)]
@@ -154,6 +179,16 @@ class StressClient:
                                 latencies.server.append(server_total)
                                 latencies.exec.append(exec_ms)
                                 latencies.queue.append(queue_ms)
+
+                            # Log job diagnostics (only stdin/code and stderr; no time)
+                            if log_f:
+                                log_stress_job(
+                                    log_f,
+                                    data.get("job_id", ""),
+                                    data.get("status", ""),
+                                    code,
+                                    data.get("stderr", "") or "",
+                                )
                         except Exception:
                             pass
                     break
@@ -178,6 +213,12 @@ async def run_stress_test(args):
     latencies = LatencyBreakdown()
     stats = {"submitted": 0, "completed": 0, "rejected": 0, "errors": 0}
 
+    # Reset any previous log file so this run logs fresh
+    log_f = None
+    if not getattr(args, "no_log", False):
+        init_or_reset_stress_log(args.log_file)
+        log_f = open(args.log_file, "a", encoding="utf-8", buffering=65536)
+
     print(f"Connecting {args.clients} concurrent tenant clients to {args.host}:{args.port}...")
     clients = [StressClient(i, args.host, args.port, workload, args.in_flight) for i in range(args.clients)]
 
@@ -186,6 +227,8 @@ async def run_stress_test(args):
     except Exception as e:
         print(f"\n[ERROR] Failed to connect to broker at {args.host}:{args.port}: {e}")
         print("Ensure the broker is running before starting the stress test.")
+        if log_f:
+            log_f.close()
         return
 
     print(f"All {args.clients} clients authenticated. Starting {args.duration}s max stress burst...")
@@ -199,7 +242,7 @@ async def run_stress_test(args):
     tasks = []
     for c in clients:
         for _ in range(args.in_flight):
-            tasks.append(asyncio.create_task(c.run_worker_loop(t_stop, latencies, stats)))
+            tasks.append(asyncio.create_task(c.run_worker_loop(t_stop, latencies, stats, log_f)))
 
     # Periodic live status reporter
     while time.monotonic() < t_stop:
@@ -217,6 +260,11 @@ async def run_stress_test(args):
     await asyncio.gather(*tasks, return_exceptions=True)
     t_end = time.monotonic()
     wall_duration = t_end - t_start
+
+    # Flush and close the log file
+    if log_f:
+        log_f.flush()
+        log_f.close()
 
     # Calculate exact CPU usage of generator
     rusage_end = resource.getrusage(resource.RUSAGE_SELF)
@@ -271,6 +319,8 @@ async def run_stress_test(args):
     print("    • Server Total:   Broker lifecycle duration (completed_at_ms - created_at_ms).")
     print("    • Client E2E:     Total wall-clock time perceived by client (Submit + Q + Exec + Poll).")
     print("-" * 80)
+    if not getattr(args, "no_log", False):
+        print(f"  Diagnostics Log:     {args.log_file} (stdin/code + stderr recorded; no time)")
     print("  Generator Efficiency & Resource Impact:")
     print(f"    Generator CPU:     {cpu_percent:.2f}% of 1 CPU core")
     print(f"    User CPU Time:     {user_cpu:.3f} s")
@@ -286,6 +336,8 @@ def main():
     parser.add_argument("--in-flight", type=int, default=2, help="In-flight jobs maintained per client (default: 2)")
     parser.add_argument("--duration", type=int, default=15, help="Test duration in seconds (default: 15)")
     parser.add_argument("--workload", choices=["micro", "mixed", "heavy"], default="mixed", help="Workload profile")
+    parser.add_argument("--log-file", default=DEFAULT_STRESS_LOG_FILE, help="File to log stdin/stderr for jobs (default: stress_job_results.log)")
+    parser.add_argument("--no-log", action="store_true", help="Disable writing job diagnostic log")
     args = parser.parse_args()
 
     asyncio.run(run_stress_test(args))

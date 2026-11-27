@@ -128,6 +128,33 @@ The broker provides two distinct, pluggable sandbox engines implementing the uni
   * **Cross-Platform macOS Bridge:** Runs natively on Linux, and seamlessly on macOS via an automated container shim (`scripts/nsjail_docker_shim.sh`) executing within an Ubuntu container without modifying broker code.
   * **Kernel Hard Timeouts:** Enforces kernel-level execution deadlines via `nsjail -t <secs>`.
   * **Side-by-Side Benchmarking:** Both Docker and Nsjail engines coexist in the same codebase, allowing direct side-by-side throughput and section-wise latency comparisons.
+  * **Multi-Tenant Filesystem Isolation & Kernel Mechanics (Security Deep Dive):**
+    * **The Shared Bind-Mount Vulnerability:** Previously, passing `--rw` to Nsjail caused any directory or file creation (e.g. `mkdir /secret_dir`, `touch /secret.txt`) to write directly to the host's `./rootfs` through the underlying bind mount. Because all clients executed against this common bind-mounted directory, state persisted across jobs, making files created by one client readable and writable by other tenants.
+    * **The User Namespace Permission Trap:** Nsjail defaults to enforcing a Read-Only root filesystem (`MS_RDONLY`). However, Nsjail also defaults to spawning an unprivileged nested user namespace (`CLONE_NEWUSER`). Under Linux kernel security constraints, an unprivileged process inside a newly formed user namespace is strictly forbidden from altering mount flags (toggling `ro`/`rw`) on mounts inherited from a parent namespace that it does not own. This caused Nsjail to crash on startup with:
+      ```text
+      mount('/run/user/nsjail.0.root', MS_REMOUNT|MS_BIND|MS_RDONLY): Operation not permitted (exit 255)
+      ```
+      The `--rw` flag was previously added as an unexamined workaround to bypass this remount error, which unintentionally left the shared `./rootfs` mutable for all tenants.
+    * **The Architectural Fix (`--disable_clone_newuser` & Ephemeral `tmpfs`):**
+      1. **Removed `--rw`:** Restored root filesystem immutability so any attempt to mutate `/`, `/etc`, or `/bin` fails with `Read-only file system (exit code 1)`.
+      2. **Added `--disable_clone_newuser`:** As defined in the Nsjail source code:
+         ```cpp
+         { "disable_clone_newuser", no_argument, nullptr, 0x0402 }, "Don't use CLONE_NEWUSER. Requires euid==0"
+         ```
+         This disables the creation of an unprivileged nested user namespace. Because the container already runs with root capabilities (`euid == 0`), Nsjail retains genuine authority in the container namespace to successfully remount the rootfs as Read-Only (`MS_RDONLY`). After locking down the mount table, Nsjail drops all privileges to an unprivileged user (UID/GID `1000`) before executing untrusted client code.
+      3. **In-Memory Scratchpad (`tmpfs`):** Allowed writes are strictly confined to `/tmp` via an in-memory `tmpfs` (`--mount none:/tmp:tmpfs:size=67108864`). Because each job executes in its own private Mount Namespace (`CLONE_NEWNS`), `/tmp` exists purely in RAM for the lifetime of that process; upon job termination, the kernel destroys the mount namespace and the memory pages evaporate instantly, eliminating cross-tenant data leakage.
+
+  * **Resource Limiting Without Cgroups (`rlimits` Fallback Engine):**
+    * **The Nested Cgroup Challenge:** In containerized development environments (such as running Nsjail inside Docker without privileged cgroup v2 subtree delegation), `cgroupv2: false` and cgroup controllers are unavailable. Previously, disabling cgroups bypassed memory and process limits entirely.
+    * **Kernel-Native POSIX `rlimits` Fallback:** When `enable_cgroups` is false, [`src/sandbox.rs`](src/sandbox.rs) dynamically translates container memory and concurrency quotas into native Linux `rlimits` executed via `setrlimit(2)`:
+      * `--rlimit_as <mem_mb>`: Caps virtual memory address space (in MB) matching `--memory` (e.g. 128 MB). Memory bomb attacks (`bytearray(300MB)`) immediately fail with Python `MemoryError` or `ENOMEM`, protecting the container from OOM kills.
+      * `--rlimit_nproc <pids_limit>`: Restricts the maximum number of simultaneous processes/threads for UID 1000 (e.g. 64), neutralizing pipeless fork bombs (`while True: os.fork()`).
+      * `--rlimit_fsize 16`: Caps single-file disk writes to 16 MB, preventing disk saturation attacks (`yes > /tmp/huge`).
+      * `--rlimit_core 0`: Disables core dump generation upon process crashes to eliminate storage bloat.
+    * **Anatomy of Fork Bomb Defense in Nsjail:**
+      * **Pipe-Based Shell Fork Bombs (`:(){ :|:& };:`):** Neutralized almost instantly by Nsjail's built-in default `RLIMIT_NOFILE = 32`. Because every pipe requires 2 file descriptors, the shell exhausts file descriptors after ~15 iterations, causing pipe creation and background forks to fail (`cannot open /dev/null`, `Cannot fork`).
+      * **Direct Process Fork Bombs (`os.fork()`):** Neutralized by our `--rlimit_nproc` fallback ceiling.
+      * **PID Namespace Cleanup:** Because Nsjail runs in standalone mode with `CLONE_NEWPID`, child processes cannot escape. When the supervisor terminates or times out, Nsjail broadcasts `SIGKILL` to the entire PID namespace and will not exit until all processes are cleanly reaped (`PIDs left: 0`).
 
 * **Broker-Enforced Supervision & Polling Optimizations:**
   * **Hard Timeout:** A supervisor thread monitors wall-clock execution against `timeout_secs`, killing runaway sandboxes and recording `TimedOut`.
@@ -661,6 +688,42 @@ Sample Section-Wise Latency Output:
     User CPU Time:     0.252 s
     System CPU Time:   0.097 s
 ================================================================================
+```
+
+---
+
+### 8.7 Sandbox Security Red Team Verification Suite
+
+To verify that the Nsjail sandbox strictly isolates tenants against state leakage, privilege escalation, and resource exhaustion, execute the live verification suite inside the container:
+
+```bash
+docker exec nsjail-dev /bin/bash -c "
+cd /workspace
+
+echo '=== 1. Rootfs Read-Only Enforcement (Fails with Read-only filesystem) ==='
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  --mount none:/tmp:tmpfs:size=67108864 -- /bin/touch /test_root.txt 2>&1
+
+echo '=== 2. Cross-Tenant Scratchpad Isolation (Job A writes to /tmp, Job B cannot read) ==='
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  --mount none:/tmp:tmpfs:size=67108864 -- /bin/sh -c 'echo secret_token > /tmp/secret.txt; cat /tmp/secret.txt'
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  --mount none:/tmp:tmpfs:size=67108864 -- /bin/sh -c 'cat /tmp/secret.txt' 2>&1
+
+echo '=== 3. Memory Ceiling Enforcement (rlimit_as catches allocation bombs) ==='
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  --rlimit_as 128 --mount none:/tmp:tmpfs:size=67108864 \
+  -- /usr/local/bin/python3 -c 'x = bytearray(300 * 1024 * 1024)' 2>&1
+
+echo '=== 4. Fork Bomb Containment (rlimit_nproc blocks process exhaustion) ==='
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  --rlimit_nproc 16 --mount none:/tmp:tmpfs:size=67108864 \
+  -- /bin/sh -c 'for i in \$(seq 1 30); do /bin/sleep 5 & done; wait' 2>&1
+
+echo '=== 5. Non-Root Execution Check (Drops to UID/GID 1000) ==='
+nsjail -Mo --chroot /workspace/rootfs --disable_clone_newuser --user 1000 --group 1000 \
+  -- /bin/sh -c 'id'
+"
 ```
 
 ---
