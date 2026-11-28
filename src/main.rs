@@ -15,6 +15,16 @@ fn check_docker_available() -> bool {
 }
 
 fn validate_nsjail_preflight(config: &Config) -> Result<(), String> {
+    // Safety check: UID pool size must strictly be >= worker_count
+    let expected_uid_pool = (config.worker_count * 4).max(16);
+    if expected_uid_pool < config.worker_count {
+        return Err(format!(
+            "Safety invariant failed: Nsjail UID pool size ({}) is smaller than worker_count ({})!\n\
+             The UID pool size must be >= worker_count to guarantee zero concurrent UID collisions.",
+            expected_uid_pool, config.worker_count
+        ));
+    }
+
     let output = Command::new(&config.nsjail_bin)
         .arg("--help")
         .output();
@@ -284,6 +294,8 @@ fn main() -> std::io::Result<()> {
 
         println!("  Nsjail Rootfs:       {}", config.nsjail_rootfs);
         println!("  Nsjail Cgroups:      {}", if config.nsjail_enable_cgroups { "Enabled" } else { "Disabled" });
+        let uid_pool = (config.worker_count * 4).max(16);
+        println!("  Nsjail UID Pool:     {} slots (UIDs 1000..{})", uid_pool, 1000 + uid_pool - 1);
     } else {
         println!("  Prewarmed Pool:      {} (enabled: {})", config.prewarmed_pool_size, config.enable_prewarmed_pool);
     }

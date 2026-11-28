@@ -62,3 +62,26 @@ fn test_nsjail_sandbox_config_and_unsupported_language() {
     assert!(res.stderr.contains("Unsupported language"));
 }
 
+#[test]
+fn test_nsjail_dynamic_uid_pool_derivation() {
+    use distributed_jobv2::sandbox::NsjailSandbox;
+
+    // Small server (1 worker): should respect the minimum floor of 16
+    let mut config1 = Config::default();
+    config1.worker_count = 1;
+    let sb1 = NsjailSandbox::new(&config1);
+    assert_eq!(sb1.uid_pool_size, 16);
+
+    // Medium server (10 workers): 10 * 4 = 40
+    let mut config10 = Config::default();
+    config10.worker_count = 10;
+    let sb10 = NsjailSandbox::new(&config10);
+    assert_eq!(sb10.uid_pool_size, 40);
+
+    // Large server (32 workers): 32 * 4 = 128
+    let mut config32 = Config::default();
+    config32.worker_count = 32;
+    let sb32 = NsjailSandbox::new(&config32);
+    assert_eq!(sb32.uid_pool_size, 128);
+}
+

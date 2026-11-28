@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering , AtomicUsize};
+use std::sync::atomic::{AtomicBool, Ordering , AtomicUsize, AtomicU32};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -700,16 +700,43 @@ pub struct NsjailSandbox {
     pub memory_limit_bytes: u64,
     pub pids_limit: u64,
     pub enable_cgroups: bool,
+    pub uid_pool_size: u32, 
+    next_slot_id: AtomicU32,
 }
 
 impl NsjailSandbox {
     pub fn new(config: &Config) -> Self {
+        // Dynamically derive the UID pool size from server concurrency settings.
+        let uid_pool_size = ((config.worker_count * 4).max(16)) as u32;
+        /*
+        
+        so because we disabled CLONE_NEWUSER , all jobs we used to run with the same user id (which was hardcoded to 1000) 
+        Thats bad because the rlimits we set (in case of a fallback , which occurs on non linux machines , cuz in that case we run nsjail inside a docker container... => we cant set cgroups) 
+        Rlimits (rlimit_nproc ) keep track of processes spawned by each uid. So different user's code (which are running with the same uid , start contributing to this limit.) 
+        Hence triggering false alarms for fork bombs..
+
+        So we rotate amongst some slots of uids . As long as the num of available uids >= number of workers , then it is mathematically guarenteed that two jobs never share the same uid. 
+        In our case we just do an atomic addition each time we run a job (which is way cheaper than say picking a random uid)
+        
+         */
+
+        // Safety check: uid_pool_size must strictly be >= worker_count to guarantee
+        // that concurrent worker threads never collide on the same Linux UID.
+        assert!(
+            (uid_pool_size as usize) >= config.worker_count,
+            "Safety invariant violated: Nsjail uid_pool_size ({}) must be >= worker_count ({}) to guarantee zero concurrent UID collisions!",
+            uid_pool_size,
+            config.worker_count
+        );
+
         Self {
             nsjail_bin: config.nsjail_bin.clone(),
             rootfs_path: config.nsjail_rootfs.clone(),
             memory_limit_bytes: parse_memory_bytes(&config.docker_memory),
             pids_limit: config.docker_pids_limit,
             enable_cgroups: config.nsjail_enable_cgroups,
+            uid_pool_size,
+            next_slot_id: AtomicU32::new(0),
         }
     }
 }
@@ -734,16 +761,32 @@ impl Sandbox for NsjailSandbox {
             }
         };
 
+        // Dynamically partition execution UIDs (1000 .. 1000 + uid_pool_size) so that concurrent
+        // jobs running across worker threads never share the same Linux UID.
+        // This guarantees that `RLIMIT_NPROC` (which the Linux kernel tracks per real UID system-wide)
+        // is strictly isolated per execution slot, preventing concurrent jobs from starving each other.
+        let slot = self.next_slot_id.fetch_add(1, Ordering::Relaxed) % self.uid_pool_size;
+        let execution_uid = (1000 + slot).to_string();
+
         let mut cmd = Command::new(&self.nsjail_bin);
         cmd.arg("-Q") // really quiet (fatal messages only)
             .arg("--mode").arg("o") // standalone once
             .arg("--chroot").arg(&self.rootfs_path) // refers to the rootfile system of the nsjail sandbox 
-            .arg("--user").arg("1000")
-            .arg("--group").arg("1000")
+            .arg("--user").arg(&execution_uid)
+            .arg("--group").arg(&execution_uid)
             .arg("--time_limit").arg(job.timeout_secs.to_string())
             .arg("--disable_proc") // disables mounting of proc file system to the sandbox
             .arg("--disable_clone_newuser") // disables nested user namespace so read-only rootfs remount succeeds
-            .arg("--mount").arg("none:/tmp:tmpfs:size=67108864"); // ephemeral in-memory tmpfs per job (evaporates on process exit) 
+            .arg("--mount").arg("none:/tmp:tmpfs:size=67108864"); // ephemeral in-memory tmpfs per job (evaporates on process exit)
+
+        // Restrict multi-core thread pool pre-allocations in linear algebra libraries (OpenBLAS/OpenMP/MKL).
+        // Without this, libraries like NumPy detect all host CPU cores and allocate thread buffers
+        // per core at import time (~32MB x num_cores), exhausting `RLIMIT_AS` before execution starts.
+        cmd.arg("-E").arg("OPENBLAS_NUM_THREADS=1")
+            .arg("-E").arg("OMP_NUM_THREADS=1")
+            .arg("-E").arg("MKL_NUM_THREADS=1")
+            .arg("-E").arg("NUMEXPR_NUM_THREADS=1")
+            .arg("-E").arg("VECLIB_MAXIMUM_THREADS=1"); 
 
         // a issue with the previous code here was that , since we were mounting the filesystem as rw any changes to the rootfs would be reflected to the .rootfs dir on the host (since we mount this dir inside the docker container which runs the nsjail binary) 
         // because of that the file system was commmon and easily readable / writable to other clients too. 

@@ -151,6 +151,13 @@ The broker provides two distinct, pluggable sandbox engines implementing the uni
       * `--rlimit_nproc <pids_limit>`: Restricts the maximum number of simultaneous processes/threads for UID 1000 (e.g. 64), neutralizing pipeless fork bombs (`while True: os.fork()`).
       * `--rlimit_fsize 16`: Caps single-file disk writes to 16 MB, preventing disk saturation attacks (`yes > /tmp/huge`).
       * `--rlimit_core 0`: Disables core dump generation upon process crashes to eliminate storage bloat.
+    * **Dynamic UID Partitioning (Cross-Tenant RLIMIT_NPROC Isolation):**
+      * Because the Linux kernel tracks `RLIMIT_NPROC` per real UID system-wide (`current_user()->processes`), hardcoding a single UID would cause concurrent jobs to compete for the same process limit.
+      * The sandbox dynamically derives a UID pool size from server concurrency settings: `uid_pool_size = (config.worker_count * 4).max(16)`.
+      * Each execution is assigned a distinct UID in round-robin fashion (`1000 + (slot % uid_pool_size)`), guaranteeing that concurrent worker executions never share a UID and that fork bombs in one job cannot starve process quotas in another.
+    * **Linear Algebra Thread Clamping (OpenBLAS / NumPy RLIMIT_AS Defense):**
+      * Pre-allocates single-threaded execution for BLAS backends via `-E OPENBLAS_NUM_THREADS=1 -E OMP_NUM_THREADS=1 -E MKL_NUM_THREADS=1 -E NUMEXPR_NUM_THREADS=1 -E VECLIB_MAXIMUM_THREADS=1`.
+      * Prevents NumPy and OpenBLAS from reserving multi-core thread memory buffers at import time (~32MB per detected host core), eliminating `Memory allocation still failed after 10 retries` crashes under strict virtual address space limits (`RLIMIT_AS`).
     * **Anatomy of Fork Bomb Defense in Nsjail:**
       * **Pipe-Based Shell Fork Bombs (`:(){ :|:& };:`):** Neutralized almost instantly by Nsjail's built-in default `RLIMIT_NOFILE = 32`. Because every pipe requires 2 file descriptors, the shell exhausts file descriptors after ~15 iterations, causing pipe creation and background forks to fail (`cannot open /dev/null`, `Cannot fork`).
       * **Direct Process Fork Bombs (`os.fork()`):** Neutralized by our `--rlimit_nproc` fallback ceiling.
